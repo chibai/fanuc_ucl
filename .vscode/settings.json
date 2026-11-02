@@ -1,5 +1,4 @@
 {
-    "rust-analyzer.cargo.features": [],
-    "rust-analyzer.check.command": "clippy",
-    "rust-analyzer.cfg.setTest": true,
+    "cmake.sourceDirectory": "${workspaceFolder}",
+    "C_Cpp.default.configurationProvider": "ms-vscode.cmake-tools"
 }

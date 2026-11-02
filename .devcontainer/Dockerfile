@@ -1,24 +1,7 @@
-FROM ubuntu:latest
+FROM ubuntu:24.04
 
-# Avoid prompts during install
 ENV DEBIAN_FRONTEND=noninteractive
-
 RUN apt-get update \
-&& apt-get install -y --no-install-recommends python3 \
-python3-pip \
-build-essential \
-git \
-python3-dev \
-cmake \
-ninja-build \
-llvm \
-pkg-config \
-libfmt-dev \
-lsb-release \
-curl \
-crossbuild-essential-arm64 \
-gcc-mingw-w64-x86-64 \
-&& rm -rf /var/lib/apt/lists/*
-
-RUN python3 -m pip config set global.break-system-packages true
-RUN pip install --no-cache-dir uv maturin ruff ziglang cargo-zigbuild
+    && apt-get install -y --no-install-recommends \
+       build-essential cmake ninja-build gdb git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*

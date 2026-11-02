@@ -4,11 +4,16 @@
 #include <cassert>
 #include <cstdint>
 #include <cstdlib>
+#include <limits>
+#include <iostream>
 #include <ranges>
 #include <vector>
 
 #undef assert
-#define assert(expression) do { if (!(expression)) std::abort(); } while (false)
+#define assert(expression) do { if (!(expression)) { \
+    std::cerr << __FILE__ << ':' << __LINE__ << ": " << #expression << '\n'; \
+    std::abort(); \
+} } while (false)
 
 using namespace fanuc::snpx;
 
@@ -54,4 +59,83 @@ int main() {
     const auto truncated = decode(std::span<const std::uint8_t>(extended).first(50));
     assert(!truncated);
     assert(truncated.error().code == Error::Code::protocol);
+
+    const auto magic = encode(make_magic(37));
+    assert(magic[0] == 8 && magic[2] == 37 && magic[30] == 37);
+    assert(magic[42] == 0x4f && magic[43] == 1);
+
+    const auto read = encode(make_read(9, Service::read_system_memory, Segment::input_bit, 8, 16));
+    assert(read.size() == 56 && read[0] == 2 && read[2] == 9);
+    assert(read[8] == 0 && read[9] == 2 && read[31] == 0xc0);
+    assert(read[36] == 0x10 && read[37] == 0x0e);
+    assert(read[40] == 1 && read[41] == 1);
+    assert(read[42] == 4 && read[43] == 0x46 && read[44] == 8 && read[46] == 16);
+
+    for (std::size_t length = 0; length < extended.size(); ++length) {
+        assert(!decode(std::span(extended).first(length)));
+    }
+    auto invalid = read;
+    invalid[4] = 1;
+    assert(!decode(invalid));
+    invalid = read;
+    invalid[31] = 0xd1;
+    assert(!decode(invalid));
+    invalid = read;
+    invalid[41] = 2;
+    assert(!decode(invalid));
+    invalid = extended;
+    invalid[49] = 2;
+    assert(!decode(invalid));
+
+    auto joined = extended;
+    joined.insert(joined.end(), read.begin(), read.end());
+    auto first = decode(joined);
+    assert(first && first->second == extended.size());
+    auto second = decode(std::span(joined).subspan(first->second));
+    assert(second && second->second == read.size());
+
+    Message response = make_response(42);
+    response.inline_payload = {0x34, 0x12, 0xff, 0xff, 0, 0};
+    auto fixed_response = decode(encode(response));
+    assert(fixed_response);
+    auto response_words = decode_words(payload_bytes(fixed_response->first), 2);
+    assert(response_words && (*response_words)[0] == 0x1234 && (*response_words)[1] == -1);
+    response.header.message_type = MessageType::extended_response;
+    response.header.payload_size = static_cast<std::uint16_t>(body.size());
+    response.payload.assign(body.begin(), body.end());
+    auto extended_response = decode(encode(response));
+    assert(extended_response && payload_bytes(extended_response->first) == response.payload);
+
+    const std::array<bool, 3> crossing{true, false, true};
+    auto crossing_bytes = encode_bits(7, crossing);
+    assert((crossing_bytes == std::vector<std::uint8_t>{0x80, 2}));
+    auto crossing_values = decode_bits(crossing_bytes, 7, crossing.size());
+    assert(crossing_values && std::ranges::equal(*crossing_values, crossing));
+    assert(!decode_bits(crossing_bytes, 7, 10));
+    assert(!decode_bits({}, std::numeric_limits<std::size_t>::max(), 1));
+    assert(!decode_words(body, 5));
+    const std::vector<std::uint8_t> oversized(65536);
+    assert(!make_write(0, Segment::registers, 0, 1, oversized));
+
+    Client client;
+    assert(!client.connect("", default_port));
+    assert(!client.connect("127.0.0.1", 0));
+    assert(!client.connect("127.0.0.1", default_port, std::chrono::milliseconds(0)));
+    assert(!client.request(make_response(0)).get());
+    auto inconsistent = *write;
+    inconsistent.header.payload_size = 1;
+    assert(!client.request(inconsistent).get());
+    assert(!client.read(digital_output, 0).get());
+    assert(!client.read(digital_output, 1, 0).get());
+    assert(!client.read(register_port, 65535, 3).get());
+    auto excessive_read = client.read(register_port, 1, 32768).get();
+    assert(!excessive_read && excessive_read.error().code == Error::Code::invalid_argument);
+    assert(!client.write_bits(digital_output, std::numeric_limits<std::size_t>::max(), bits).get());
+    assert(!client.write_words(analog_output, std::numeric_limits<std::size_t>::max(), words).get());
+    assert(!client.write_words(group_input, 0, words).get());
+    assert(!client.register_asg("A B", 2));
+    assert(!client.register_asg("A", 2, std::numeric_limits<float>::quiet_NaN()));
+    assert(!client.command("").get());
+    auto disconnected = client.read(digital_output, 1).get();
+    assert(!disconnected && disconnected.error().code == Error::Code::disconnected);
 }
