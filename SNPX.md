@@ -224,7 +224,21 @@ if __name__ == "__main__":
 
 Python 的 `read` / `write` 使用数据端口类作为第一个参数。`register_sysvar_asg` 的 Python 接口根据传入类型（如 `bool`、`int`、`float`、`str`）选择 ASG 编解码类型；Rust 则由 `SysVarArgs<T>` 的类型参数确定。
 
-## 8. 常见错误与排查
+## 8. C++23 实现
+
+仓库提供一个无第三方库依赖的独立 C++23 实现，位于 `cpp/`。它包含 SNP-X 帧编解码、带超时的 TCP 连接和 INIT/MAGIC/CLRASG 握手、后台 I/O 线程、8 位序号响应匹配、常用位/字端口读写，以及 ASG 命令和寄存器访问。接口使用 `std::expected` 表示同步错误，使用 `std::future` 表示异步请求响应；TCP socket 由平台原生 socket API 提供。预定义输入端口为只读，写入 API 会拒绝这些端口。
+
+```sh
+cmake -S cpp -B build/cpp
+cmake --build build/cpp
+ctest --test-dir build/cpp --output-on-failure
+```
+
+完整可执行示例在 `cpp/examples/snpx_example.cpp`。`Client::read` 返回原始 SNP-X 响应；用 `payload_bytes(response)` 取响应载荷，再按数据类型调用 `decode_bits` 或 `decode_words`。位读取的载荷从驱动为读取范围对齐后的首字节开始，所以调用 `decode_bits` 时传入所请求起始位相对于该首字节的位偏移；例如 DO1 对齐后从 bit 0 开始。ASG 接口接受变量名和寄存器长度，返回起始 R 地址，调用方需按映射变量的数据布局自行编码/解码寄存器。
+
+该实现的协议覆盖范围与前述限制一致，未实现完整厂商 SNP-X 服务集合、TLS、控制器错误帧语义或多分片扩展报文。
+
+## 9. 常见错误与排查
 
 | 错误/现象 | 含义与建议 |
 |---|---|
