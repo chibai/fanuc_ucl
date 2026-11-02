@@ -406,6 +406,8 @@ def main():
 
 ### HMI
 
+SNP-X/HMI 的握手、帧布局、端口编码及 ASG 变量映射详见 [SNPX.md](SNPX.md)。
+
 ```rust
 use std::time::Duration;
 
