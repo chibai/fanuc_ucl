@@ -3,14 +3,14 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
-#include <condition_variable>
+#include <cerrno>
+#include <cmath>
 #include <cstring>
 #include <deque>
 #include <format>
 #include <limits>
 #include <mutex>
 #include <optional>
-#include <stdexcept>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -18,6 +18,9 @@
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
 #endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -27,6 +30,7 @@ static int socket_error() { return WSAGetLastError(); }
 static bool would_block(int error) {
     return error == WSAEWOULDBLOCK || error == WSAEINPROGRESS;
 }
+static bool interrupted(int error) { return error == WSAEINTR; }
 static void close_socket(NativeSocket socket) { closesocket(socket); }
 #else
 #include <arpa/inet.h>
@@ -43,6 +47,7 @@ static int socket_error() { return errno; }
 static bool would_block(int error) {
     return error == EAGAIN || error == EWOULDBLOCK || error == EINPROGRESS;
 }
+static bool interrupted(int error) { return error == EINTR; }
 static void close_socket(NativeSocket socket) { ::close(socket); }
 #endif
 
@@ -151,8 +156,6 @@ Message make_magic(std::uint8_t sequence) {
     Message message;
     message.header = client_header(MessageType::request, sequence, Operation::writing);
     message.header.packet_type = 8;
-    message.header.sequence1 = 1;
-    message.header.sequence2 = 1;
     message.service = Service::magic;
     message.segment = Segment::magic;
     return message;
@@ -286,6 +289,13 @@ Result<std::pair<Message, std::size_t>> decode(std::span<const std::uint8_t> byt
         return std::unexpected(make_error(Error::Code::protocol, "unsupported SNP-X message type"));
     }
     h.message_type = static_cast<MessageType>(type);
+    const bool extended = h.message_type == MessageType::extended_request ||
+                          h.message_type == MessageType::extended_response;
+    if ((!extended && h.payload_size != 0) ||
+        (h.message_type != MessageType::init &&
+         (h.packet_number != 1 || h.total_packets != 1))) {
+        return std::unexpected(make_error(Error::Code::protocol, "invalid length or unsupported SNP-X fragmentation"));
+    }
     const auto frame_size = fixed_frame_size + h.payload_size;
     if (bytes.size() < frame_size) {
         return std::unexpected(make_error(Error::Code::protocol, "incomplete SNP-X frame"));
@@ -321,6 +331,9 @@ Result<std::pair<Message, std::size_t>> decode(std::span<const std::uint8_t> byt
         }
         message.service = static_cast<Service>(service);
         message.segment = static_cast<Segment>(segment);
+        if (packet != 1 || total != 1) {
+            return std::unexpected(make_error(Error::Code::protocol, "unsupported SNP-X extended fragmentation"));
+        }
         message.payload.assign(bytes.begin() + static_cast<std::ptrdiff_t>(reader.offset),
                               bytes.begin() + static_cast<std::ptrdiff_t>(frame_size));
         break;
@@ -336,6 +349,9 @@ Result<std::pair<Message, std::size_t>> decode(std::span<const std::uint8_t> byt
         }
         message.service = static_cast<Service>(service);
         message.segment = static_cast<Segment>(segment);
+        if (packet != 1 || total != 1) {
+            return std::unexpected(make_error(Error::Code::protocol, "unsupported SNP-X extended fragmentation"));
+        }
         message.plc_status[0] = flags[0];
         message.plc_status[1] = flags[1];
         message.payload.assign(bytes.begin() + static_cast<std::ptrdiff_t>(reader.offset),
@@ -411,6 +427,18 @@ std::vector<std::uint8_t> encode_words(std::span<const std::int16_t> values) {
 }
 
 struct Client::Impl {
+    struct PendingResponse {
+        std::shared_ptr<std::promise<Response>> promise;
+        std::chrono::steady_clock::time_point deadline;
+        bool initialization;
+    };
+
+    struct AsgMapping {
+        std::uint16_t address;
+        std::uint16_t registers;
+        float multiplier;
+    };
+
     struct PendingWrite {
         std::vector<std::uint8_t> bytes;
         std::size_t offset{};
@@ -422,21 +450,22 @@ struct Client::Impl {
     std::jthread worker;
     std::mutex mutex;
     std::deque<PendingWrite> outgoing;
-    std::unordered_map<std::uint8_t, std::shared_ptr<std::promise<Response>>> pending;
+    std::unordered_map<std::uint8_t, PendingResponse> pending;
+    std::chrono::milliseconds request_timeout{std::chrono::seconds(1)};
     std::uint8_t next_sequence{};
     std::mutex asg_mutex;
-    std::unordered_map<std::string, std::pair<std::uint16_t, std::uint16_t>> asg;
+    std::unordered_map<std::string, AsgMapping> asg;
     std::uint32_t next_asg_address{1};
 #ifdef _WIN32
     bool winsock_initialized{};
 #endif
 
-    std::uint8_t allocate_sequence() {
+    std::optional<std::uint8_t> allocate_sequence() {
         for (unsigned i = 0; i < 256; ++i) {
             const auto candidate = next_sequence++;
             if (!pending.contains(candidate)) return candidate;
         }
-        throw std::runtime_error("all SNP-X sequence numbers are in use");
+        return std::nullopt;
     }
 
     ResponseFuture enqueue(Message message) {
@@ -445,46 +474,56 @@ struct Client::Impl {
             return failed_future<Message>(
                 make_error(Error::Code::disconnected, "SNP-X client is not connected"));
         }
-        std::uint8_t sequence{};
-        try {
-            sequence = allocate_sequence();
-        } catch (const std::exception& e) {
+        const auto allocated = allocate_sequence();
+        if (!allocated) {
             return failed_future<Message>(
-                make_error(Error::Code::invalid_argument, e.what()));
+                make_error(Error::Code::resource_exhausted, "all 256 SNP-X sequence numbers are in use"));
         }
+        const auto sequence = *allocated;
         message.header.sequence1 = sequence;
         message.header.sequence2 = sequence;
         auto promise = std::make_shared<std::promise<Response>>();
         auto future = promise->get_future();
-        pending.emplace(sequence, promise);
+        pending.emplace(sequence, PendingResponse{
+            promise, std::chrono::steady_clock::now() + request_timeout,
+            message.header.message_type == MessageType::init});
         outgoing.push_back(PendingWrite{encode(message), 0, sequence});
         return future;
     }
 
     void fail_all(Error error) {
-        std::unordered_map<std::uint8_t, std::shared_ptr<std::promise<Response>>> waiting;
+        std::unordered_map<std::uint8_t, PendingResponse> waiting;
         {
             std::lock_guard lock(mutex);
             waiting.swap(pending);
             outgoing.clear();
         }
-        for (auto& [sequence, promise] : waiting) {
+        for (auto& [sequence, response] : waiting) {
             (void)sequence;
-            try { promise->set_value(std::unexpected(error)); } catch (...) {}
+            response.promise->set_value(std::unexpected(error));
         }
     }
 
-    void finish_response(Message message) {
+    Result<void> finish_response(Message message) {
         std::shared_ptr<std::promise<Response>> promise;
         const auto sequence = static_cast<std::uint8_t>(message.header.sequence1);
         {
             std::lock_guard lock(mutex);
             const auto it = pending.find(sequence);
-            if (it == pending.end()) return;
-            promise = std::move(it->second);
+            if (it == pending.end()) {
+                return std::unexpected(make_error(Error::Code::protocol, "unsolicited SNP-X response sequence"));
+            }
+            const auto type = message.header.message_type;
+            if ((it->second.initialization && type != MessageType::init) ||
+                (!it->second.initialization && type != MessageType::response &&
+                 type != MessageType::extended_response)) {
+                return std::unexpected(make_error(Error::Code::protocol, "unexpected SNP-X response type"));
+            }
+            promise = std::move(it->second.promise);
             pending.erase(it);
         }
-        try { promise->set_value(std::move(message)); } catch (...) {}
+        promise->set_value(std::move(message));
+        return {};
     }
 
     void run(std::stop_token stop) {
@@ -492,6 +531,18 @@ struct Client::Impl {
         std::array<std::uint8_t, 4096> scratch{};
         Error terminal = make_error(Error::Code::disconnected, "SNP-X connection closed");
         while (!stop.stop_requested() && live.load()) {
+            {
+                std::lock_guard lock(mutex);
+                const auto now = std::chrono::steady_clock::now();
+                if (std::ranges::any_of(pending, [now](const auto& entry) {
+                        return now >= entry.second.deadline;
+                    })) {
+                    // Closing the session prevents a late reply from matching a reused sequence.
+                    terminal = make_error(Error::Code::timeout, "SNP-X request timed out; session invalidated");
+                    live.store(false);
+                    break;
+                }
+            }
             fd_set reads, writes;
             FD_ZERO(&reads);
             FD_ZERO(&writes);
@@ -507,6 +558,7 @@ struct Client::Impl {
             const int selected = select(socket + 1, &reads, &writes, nullptr, &interval);
 #endif
             if (selected < 0) {
+                if (interrupted(socket_error())) continue;
                 terminal = make_error(Error::Code::io, std::format("select failed ({})", socket_error()));
                 break;
             }
@@ -530,7 +582,7 @@ struct Client::Impl {
 #endif
                     if (sent < 0) {
                         const auto error = socket_error();
-                        if (would_block(error)) break;
+                        if (would_block(error) || interrupted(error)) break;
                         terminal = make_error(Error::Code::io, std::format("send failed ({})", error));
                         live.store(false);
                         break;
@@ -559,7 +611,7 @@ struct Client::Impl {
                 }
                 if (received < 0) {
                     const auto error = socket_error();
-                    if (would_block(error)) continue;
+                    if (would_block(error) || interrupted(error)) continue;
                     terminal = make_error(Error::Code::io, std::format("recv failed ({})", error));
                     break;
                 }
@@ -577,12 +629,24 @@ struct Client::Impl {
                     }
                     auto [message, consumed] = std::move(*decoded);
                     input.erase(input.begin(), input.begin() + static_cast<std::ptrdiff_t>(consumed));
-                    finish_response(std::move(message));
+                    if (auto result = finish_response(std::move(message)); !result) {
+                        terminal = result.error();
+                        live.store(false);
+                        break;
+                    }
                 }
                 if (!live.load()) break;
             }
         }
         live.store(false);
+        if (stop.stop_requested()) {
+            terminal = make_error(Error::Code::disconnected, "SNP-X client disconnected");
+        }
+#ifdef _WIN32
+        shutdown(socket, SD_BOTH);
+#else
+        shutdown(socket, SHUT_RDWR);
+#endif
         fail_all(std::move(terminal));
     }
 };
@@ -591,9 +655,12 @@ Client::Client() : impl_(std::make_unique<Impl>()) {}
 Client::~Client() { disconnect(); }
 
 Result<void> Client::connect(
-    std::string_view host, std::uint16_t port, std::chrono::milliseconds timeout) {
-    if (timeout <= std::chrono::milliseconds::zero()) {
-        return std::unexpected(make_error(Error::Code::invalid_argument, "connect timeout must be positive"));
+    std::string_view host, std::uint16_t port, std::chrono::milliseconds timeout,
+    std::chrono::milliseconds request_timeout) {
+    if (host.empty() || host.find('\0') != std::string_view::npos || port == 0 ||
+        timeout <= std::chrono::milliseconds::zero() ||
+        request_timeout <= std::chrono::milliseconds::zero()) {
+        return std::unexpected(make_error(Error::Code::invalid_argument, "host, port and positive timeouts are required"));
     }
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     disconnect();
@@ -631,12 +698,25 @@ Result<void> Client::connect(
         }
 #ifdef _WIN32
         u_long nonblocking = 1;
-        ioctlsocket(candidate, FIONBIO, &nonblocking);
+        if (ioctlsocket(candidate, FIONBIO, &nonblocking) != 0) {
+            last_error = std::format("setting nonblocking socket failed ({})", socket_error());
+            close_socket(candidate);
+            continue;
+        }
         const int result = ::connect(candidate, address->ai_addr, static_cast<int>(address->ai_addrlen));
         if (result == SOCKET_ERROR && socket_error() != WSAEWOULDBLOCK && socket_error() != WSAEINPROGRESS) {
 #else
+        if (candidate >= FD_SETSIZE) {
+            last_error = "socket descriptor exceeds select FD_SETSIZE";
+            close_socket(candidate);
+            continue;
+        }
         const int flags = fcntl(candidate, F_GETFL, 0);
-        fcntl(candidate, F_SETFL, flags | O_NONBLOCK);
+        if (flags < 0 || fcntl(candidate, F_SETFL, flags | O_NONBLOCK) < 0) {
+            last_error = std::format("setting nonblocking socket failed ({})", socket_error());
+            close_socket(candidate);
+            continue;
+        }
         const int result = ::connect(candidate, address->ai_addr, address->ai_addrlen);
         if (result < 0 && errno != EINPROGRESS) {
 #endif
@@ -645,8 +725,11 @@ Result<void> Client::connect(
             continue;
         }
         fd_set writable;
+        fd_set exceptional;
         FD_ZERO(&writable);
+        FD_ZERO(&exceptional);
         FD_SET(candidate, &writable);
+        FD_SET(candidate, &exceptional);
         const auto now = std::chrono::steady_clock::now();
         if (now >= deadline) {
             last_error = "TCP connect timed out";
@@ -659,9 +742,9 @@ Result<void> Client::connect(
             static_cast<long>(timeout_ms / 1000),
             static_cast<long>((timeout_ms % 1000) * 1000)};
 #ifdef _WIN32
-        const int selected = select(0, nullptr, &writable, nullptr, &wait);
+        const int selected = select(0, nullptr, &writable, &exceptional, &wait);
 #else
-        const int selected = select(candidate + 1, nullptr, &writable, nullptr, &wait);
+        const int selected = select(candidate + 1, nullptr, &writable, &exceptional, &wait);
 #endif
         if (selected <= 0) {
             last_error = selected == 0 ? "TCP connect timed out" :
@@ -699,18 +782,30 @@ Result<void> Client::connect(
     }
 #ifdef _WIN32
     BOOL no_delay = TRUE;
-    setsockopt(connected_socket, IPPROTO_TCP, TCP_NODELAY,
-               reinterpret_cast<const char*>(&no_delay), sizeof(no_delay));
+    const int configured = setsockopt(connected_socket, IPPROTO_TCP, TCP_NODELAY,
+                                     reinterpret_cast<const char*>(&no_delay), sizeof(no_delay));
 #else
     const int no_delay = 1;
-    setsockopt(connected_socket, IPPROTO_TCP, TCP_NODELAY, &no_delay, sizeof(no_delay));
+    int configured = setsockopt(connected_socket, IPPROTO_TCP, TCP_NODELAY, &no_delay, sizeof(no_delay));
 #ifdef SO_NOSIGPIPE
     const int no_sigpipe = 1;
-    setsockopt(connected_socket, SOL_SOCKET, SO_NOSIGPIPE, &no_sigpipe, sizeof(no_sigpipe));
+    if (configured == 0) {
+        configured = setsockopt(connected_socket, SOL_SOCKET, SO_NOSIGPIPE, &no_sigpipe, sizeof(no_sigpipe));
+    }
 #endif
 #endif
+    if (configured != 0) {
+        const auto error = make_error(Error::Code::io, std::format("socket configuration failed ({})", socket_error()));
+        close_socket(connected_socket);
+#ifdef _WIN32
+        WSACleanup();
+        impl_->winsock_initialized = false;
+#endif
+        return std::unexpected(error);
+    }
     impl_->socket = connected_socket;
     impl_->next_sequence = 0;
+    impl_->request_timeout = timeout;
     {
         std::lock_guard lock(impl_->asg_mutex);
         impl_->asg.clear();
@@ -727,7 +822,8 @@ Result<void> Client::connect(
         return future.get();
     };
     auto init_result = await(request(make_init()));
-    if (!init_result || init_result->header != make_init(true).header) {
+    if (!init_result || init_result->response_unknown != 0 ||
+        encode(*init_result) != encode(make_init(true))) {
         auto error = init_result ? make_error(Error::Code::protocol, "controller returned an invalid INIT_ACK")
                                  : init_result.error();
         disconnect();
@@ -745,11 +841,13 @@ Result<void> Client::connect(
         disconnect();
         return std::unexpected(std::move(error));
     }
+    impl_->request_timeout = request_timeout;
     return {};
 }
 
 void Client::disconnect() noexcept {
     if (!impl_) return;
+    if (impl_->worker.joinable()) impl_->worker.request_stop();
     impl_->live.store(false);
     if (impl_->socket != invalid_socket) {
 #ifdef _WIN32
@@ -759,7 +857,6 @@ void Client::disconnect() noexcept {
 #endif
     }
     if (impl_->worker.joinable()) {
-        impl_->worker.request_stop();
         impl_->worker.join();
     }
     if (impl_->socket != invalid_socket) {
@@ -779,13 +876,24 @@ bool Client::connected() const noexcept {
 }
 
 Client::ResponseFuture Client::request(Message message) {
+    const auto type = message.header.message_type;
+    const bool extended = type == MessageType::extended_request;
+    if ((type != MessageType::init && type != MessageType::request && !extended) ||
+        message.payload.size() > std::numeric_limits<std::uint16_t>::max() ||
+        message.header.payload_size != message.payload.size() ||
+        (!extended && !message.payload.empty()) ||
+        (type != MessageType::init &&
+         (message.header.packet_number != 1 || message.header.total_packets != 1))) {
+        return failed_future<Message>(
+            make_error(Error::Code::invalid_argument, "invalid SNP-X request type, length or fragmentation"));
+    }
     return impl_->enqueue(std::move(message));
 }
 
 Client::ResponseFuture Client::read(Port port, std::size_t index, std::size_t count) {
     if ((!port.zero_indexed && index == 0) ||
         index > std::numeric_limits<std::uint16_t>::max() ||
-        count > std::numeric_limits<std::uint16_t>::max()) {
+        count == 0 || count > std::numeric_limits<std::uint16_t>::max()) {
         return failed_future<Message>(
             make_error(Error::Code::invalid_argument, "port index/count is outside its valid range"));
     }
@@ -803,6 +911,7 @@ Client::ResponseFuture Client::read(Port port, std::size_t index, std::size_t co
         adjusted_count = ((end + 7) / 8) * 8 - target;
     }
     if (adjusted_count > std::numeric_limits<std::uint16_t>::max() ||
+        (!port.bit_packed && adjusted_count > 32767) ||
         target > std::numeric_limits<std::uint16_t>::max()) {
         return failed_future<Message>(
             make_error(Error::Code::invalid_argument, "aligned port range exceeds SNP-X range"));
@@ -818,13 +927,15 @@ Client::ResponseFuture Client::write_bits(
         return failed_future<Message>(
             make_error(Error::Code::invalid_argument, "refusing to write a read-only SNP-X port"));
     }
-    if (!port.bit_packed || (!port.zero_indexed && index == 0)) {
+    if (!port.bit_packed || values.empty() ||
+        index > std::numeric_limits<std::uint16_t>::max() ||
+        (!port.zero_indexed && index == 0)) {
         return failed_future<Message>(
             make_error(Error::Code::invalid_argument, "invalid bit port or index"));
     }
     const auto address = index - (port.zero_indexed ? 0 : 1);
     const auto target = address + port.base_offset;
-    if (target + values.size() > 65536) {
+    if (target > 65535 || values.size() > 65536 - target) {
         return failed_future<Message>(
             make_error(Error::Code::invalid_argument, "bit write range exceeds SNP-X address space"));
     }
@@ -846,13 +957,15 @@ Client::ResponseFuture Client::write_words(
         return failed_future<Message>(
             make_error(Error::Code::invalid_argument, "refusing to write a read-only SNP-X port"));
     }
-    if (port.bit_packed || (!port.zero_indexed && index == 0)) {
+    if (port.bit_packed || values.empty() ||
+        index > std::numeric_limits<std::uint16_t>::max() ||
+        (!port.zero_indexed && index == 0)) {
         return failed_future<Message>(
             make_error(Error::Code::invalid_argument, "invalid word port or index"));
     }
     const auto address = index - (port.zero_indexed ? 0 : 1);
     const auto target = address + port.base_offset;
-    if (target + values.size() > 65536) {
+    if (target > 65535 || values.size() > 65536 - target) {
         return failed_future<Message>(
             make_error(Error::Code::invalid_argument, "word write range exceeds SNP-X address space"));
     }
@@ -869,9 +982,9 @@ Client::ResponseFuture Client::write_words(
 }
 
 Client::ResponseFuture Client::command(std::string_view text) {
-    if (text.size() > std::numeric_limits<std::uint16_t>::max()) {
+    if (text.empty() || text.size() > std::numeric_limits<std::uint16_t>::max()) {
         return failed_future<Message>(
-            make_error(Error::Code::invalid_argument, "command is too long"));
+            make_error(Error::Code::invalid_argument, "command must contain 1 to 65535 bytes"));
     }
     const auto data = std::span(
         reinterpret_cast<const std::uint8_t*>(text.data()), text.size());
@@ -884,8 +997,9 @@ Client::ResponseFuture Client::command(std::string_view text) {
 Result<std::uint16_t> Client::register_asg(
     std::string_view variable, std::uint16_t registers, float multiplier,
     std::chrono::milliseconds timeout) {
-    if (variable.empty() || registers == 0) {
-        return std::unexpected(make_error(Error::Code::invalid_argument, "ASG name and register count must be non-empty"));
+    if (variable.empty() || registers == 0 || !std::isfinite(multiplier) ||
+        timeout <= std::chrono::milliseconds::zero()) {
+        return std::unexpected(make_error(Error::Code::invalid_argument, "ASG requires a name, register count, finite multiplier and positive timeout"));
     }
     if (std::ranges::any_of(variable, [](unsigned char ch) {
             return ch <= 0x20 || ch == 0x7f;
@@ -893,9 +1007,15 @@ Result<std::uint16_t> Client::register_asg(
         return std::unexpected(make_error(Error::Code::invalid_argument, "ASG name cannot contain whitespace or control characters"));
     }
     std::lock_guard lock(impl_->asg_mutex);
+    if (!connected()) {
+        return std::unexpected(make_error(Error::Code::disconnected, "ASG registration requires a connection"));
+    }
     const std::string name(variable);
     if (const auto it = impl_->asg.find(name); it != impl_->asg.end()) {
-        return it->second.first;
+        if (it->second.registers != registers || it->second.multiplier != multiplier) {
+            return std::unexpected(make_error(Error::Code::invalid_argument, "ASG name already registered with different parameters"));
+        }
+        return it->second.address;
     }
     if (impl_->next_asg_address + registers > 65536) {
         return std::unexpected(make_error(Error::Code::invalid_argument, "ASG register space exhausted"));
@@ -904,11 +1024,12 @@ Result<std::uint16_t> Client::register_asg(
     const auto statement = std::format("SETASG {} {} {} {}", address, registers, name, multiplier);
     auto future = command(statement);
     if (future.wait_for(timeout) != std::future_status::ready) {
+        disconnect();
         return std::unexpected(make_error(Error::Code::timeout, "SETASG acknowledgement timed out"));
     }
     auto response = future.get();
     if (!response) return std::unexpected(response.error());
-    impl_->asg.emplace(name, std::pair{address, registers});
+    impl_->asg.emplace(name, Impl::AsgMapping{address, registers, multiplier});
     impl_->next_asg_address += registers;
     return address;
 }

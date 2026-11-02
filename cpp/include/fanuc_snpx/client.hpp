@@ -10,6 +10,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace fanuc::snpx {
@@ -60,6 +61,7 @@ struct Error {
         timeout,
         disconnected,
         protocol,
+        resource_exhausted,
     };
 
     Code code;
@@ -159,7 +161,8 @@ public:
     [[nodiscard]] Result<void> connect(
         std::string_view host,
         std::uint16_t port = default_port,
-        std::chrono::milliseconds timeout = std::chrono::seconds(1));
+        std::chrono::milliseconds timeout = std::chrono::seconds(1),
+        std::chrono::milliseconds request_timeout = std::chrono::seconds(1));
     void disconnect() noexcept;
     [[nodiscard]] bool connected() const noexcept;
 

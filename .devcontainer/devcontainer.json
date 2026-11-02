@@ -1,8 +1,5 @@
 {
-    "name": "fanuc_ucl",
-    "runArgs": [
-        "--platform=linux/amd64"
-    ],
+    "name": "FANUC SNP-X C++23",
     "build": {
         "dockerfile": "Dockerfile",
         "context": ".."
@@ -10,23 +7,9 @@
     "customizations": {
         "vscode": {
             "extensions": [
-                "ms-python.debugpy",
-                "ms-python.python",
-                "ms-python.black-formatter",
-                "mhutchie.git-graph",
-                "fill-labs.dependi",
-                "tamasfe.even-better-toml",
-                "rust-lang.rust-analyzer"
+                "ms-vscode.cpptools",
+                "ms-vscode.cmake-tools"
             ]
         }
-    },
-    "postStartCommand": "sudo usermod -aG sudo vscode",
-    "postCreateCommand": "sudo chown -R vscode:vscode /workspaces/fanuc_ucl",
-    "features": {
-        "ghcr.io/devcontainers/features/common-utils:2": {
-            "username": "vscode"
-        },
-        "ghcr.io/devcontainers/features/github-cli:1": {},
-        "ghcr.io/devcontainers/features/rust:1.5.0": {}
     }
 }
