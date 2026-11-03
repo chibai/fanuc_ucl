@@ -52,7 +52,7 @@ int main() {
 cmake --install build --config Release --prefix install
 ```
 
-详细说明见 [C++23 架构与依赖说明](docs/ARCHITECTURE.md)，线上字节格式和端口表见 [SNPX 协议说明](SNPX.md)。
+接口功能、参数约定和完整使用示例见 [C++ API 参考](docs/API.md)；架构与依赖说明见 [C++23 架构说明](docs/ARCHITECTURE.md)，线上字节格式和端口表见 [SNPX 协议说明](SNPX.md)。
 
 ## 范围与安全
 
