@@ -1,6 +1,6 @@
 # FANUC SNP-X · C++23
 
-专注于 FANUC SNPX（SNP-X）HMI 数据访问的 C++23 客户端，默认使用 TCP `60008`。工程仅保留 SNPX：帧编解码、连接握手、异步请求、位/字端口读写和 ASG 变量映射。
+面向多品牌机械臂数据访问的 C++23 驱动接口，目前提供 FANUC SNPX（SNP-X）实现，默认使用 TCP `60008`。FANUC 实现支持帧编解码、连接握手、异步请求、位/字端口读写和 ASG 变量映射；尚未实现其他品牌协议。
 
 **依赖选型：网络统一使用 Boost.Asio；错误和格式化使用 C++23 标准库；不使用 JSON 库。** Asio 异步 I/O、`co_await` 协程和定时器替代平台 socket 代码与轮询；公共接口保留 `std::future<std::expected<…>>`。SNPX 使用二进制帧，JSON 不属于其传输格式。`std::asio` 不属于 C++23 标准库，本项目使用 `boost::asio`。
 
@@ -39,6 +39,37 @@ code .
 若编译器安装路径不同，同时修改 `.vscode/settings.json` 和 `.vscode/tasks.json` 中的 `/usr/bin/g++-15`。更换已有构建目录的编译器或生成器前，先运行 **CMake: Delete Cache and Reconfigure**。这些工作区配置面向上述本机环境；现有 Ubuntu 24.04 Dev Container 默认只有 GCC 13，使用它时也需相应调整编译器路径。
 
 ## 使用
+
+### 品牌无关接口
+
+`robot::RobotDriver` 是抽象基类，`fanuc::FanucDriver` 继承它并复用现有 SNP-X 客户端。业务代码依赖基类，后续品牌实现同一接口即可替换：
+
+```cpp
+#include <fanuc_snpx/fanuc_driver.hpp>
+#include <iostream>
+#include <memory>
+
+int main() {
+    std::unique_ptr<robot::RobotDriver> driver =
+        std::make_unique<fanuc::FanucDriver>();
+    if (auto result = driver->connect("10.0.0.1", 60008); !result) {
+        std::cerr << result.error().message << '\n';
+        return 1;
+    }
+    auto bits = driver->read_bits(robot::Port::digital_output, 0);
+    if (!bits) {
+        std::cerr << bits.error().message << '\n';
+        return 1;
+    }
+    std::cout << "DO1 = " << (*bits)[0] << '\n';
+}
+```
+
+通用接口统一采用 **0 起始索引**，读写同步等待设备响应，返回 `robot::Result<T>`；目前抽象连接、数字 I/O、模拟 I/O 和 16 位寄存器读写，不包含运动控制。通过基类连接时必须显式指定端口，直接调用 `FanucDriver::connect(host)` 则默认使用 `60008`。新增品牌只需包含 `robot/robot_driver.hpp` 并继承 `robot::RobotDriver`，不应依赖 SNP-X 消息类型。
+
+### FANUC 专有接口（保持兼容）
+
+需要异步请求、ASG、UOP 或原始报文时，继续使用 `fanuc::snpx::Client`；其接口、端口索引规则与原有行为保持不变：
 
 ```cpp
 #include <fanuc_snpx/client.hpp>

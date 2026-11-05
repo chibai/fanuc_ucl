@@ -6,7 +6,7 @@ include(CMakePackageConfigHelpers)
 find_package(Threads REQUIRED)
 find_package(Boost 1.74 REQUIRED)
 
-add_library(fanuc_snpx src/client.cpp)
+add_library(fanuc_snpx src/client.cpp src/fanuc_driver.cpp)
 add_library(fanuc_snpx::fanuc_snpx ALIAS fanuc_snpx)
 target_include_directories(fanuc_snpx PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>

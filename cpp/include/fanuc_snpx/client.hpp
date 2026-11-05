@@ -1,5 +1,7 @@
 #pragma once
 
+#include "robot/types.hpp"
+
 #include <array>
 #include <chrono>
 #include <cstddef>
@@ -54,22 +56,10 @@ enum class Operation : std::uint32_t {
     reading = 0x200,
 };
 
-struct Error {
-    enum class Code {
-        invalid_argument,
-        io,
-        timeout,
-        disconnected,
-        protocol,
-        resource_exhausted,
-    };
-
-    Code code;
-    std::string message;
-};
+using Error = robot::Error;
 
 template <class T>
-using Result = std::expected<T, Error>;
+using Result = robot::Result<T>;
 
 struct Header {
     std::uint16_t packet_type{};

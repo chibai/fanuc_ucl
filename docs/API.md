@@ -1,6 +1,40 @@
 # FANUC SNP-X C++ API 参考
 
-本文按公共头文件 `fanuc_snpx/client.hpp` 说明当前实现的功能、接口契约和使用方式。它描述的是本项目实现的 SNP-X HMI 数据访问子集，不是 FANUC 全量协议规范。帧格式、传输细节、数据段偏移及兼容性限制见 [SNP-X 二进制协议说明](../SNPX.md)；线程、超时和构建集成细节见 [架构说明](ARCHITECTURE.md)。
+本文说明品牌无关驱动接口及 `fanuc_snpx/client.hpp` 底层接口的功能、契约和使用方式。当前仅实现 SNP-X HMI 数据访问子集，不是 FANUC 全量协议规范。帧格式、传输细节、数据段偏移及兼容性限制见 [SNP-X 二进制协议说明](../SNPX.md)；线程、超时和构建集成细节见 [架构说明](ARCHITECTURE.md)。
+
+## 品牌无关驱动接口
+
+公共头文件 `robot/robot_driver.hpp` 定义抽象基类 `robot::RobotDriver`，不依赖 FANUC 类型。`fanuc_snpx/fanuc_driver.hpp` 定义继承它的 `fanuc::FanucDriver`，内部组合 `fanuc::snpx::Client`。两者均不可复制、不可移动；基类具有虚析构函数，可以通过基类智能指针安全销毁。
+
+| 方法 | 返回值与契约 |
+|---|---|
+| `connect(host, port, timeout = 1s, request_timeout = 1s)` | `robot::Result<void>`；基类必须指定端口，`FanucDriver` 默认端口为 `60008` |
+| `disconnect() noexcept` | `void`；可重复调用 |
+| `connected() const noexcept` | `bool`；仅表示瞬时连接状态 |
+| `read_bits(port, index, count = 1)` | `robot::Result<std::vector<bool>>` |
+| `write_bits(port, index, span<const bool>)` | `robot::Result<void>` |
+| `read_words(port, index, count = 1)` | `robot::Result<std::vector<int16_t>>` |
+| `write_words(port, index, span<const int16_t>)` | `robot::Result<void>` |
+
+所有读写都是**同步**接口：内部等待原异步请求完成，受 `request_timeout` 约束，不创建额外等待线程。失败显式返回 `robot::Error`，不自动重试或重连。字值是有符号 16 位数据，不自动转换模拟量工程单位、浮点数或复杂寄存器类型。
+
+`robot::Port` 提供以下逻辑端口；**所有通用接口索引均从 0 开始**：
+
+| 端口 | 类型 | FANUC 映射 | 可写 |
+|---|---|---|---|
+| `digital_input` | 位 | SNP-X `digital_input`，wire 基址 0 | 否 |
+| `digital_output` | 位 | SNP-X `digital_output`，索引 0 对应原 `Client` 索引 1（DO1） | 是 |
+| `analog_input` | 字 | SNP-X `analog_input`，wire 基址 1000 | 否 |
+| `analog_output` | 字 | SNP-X `analog_output`，索引 0 对应原 `Client` 索引 1，wire 基址 1000 | 是 |
+| `registers` | 字 | SNP-X `register_port`，索引 0 对应原 `Client` 索引 1（R1） | 是 |
+
+通用端口方向与原 SNP-X 描述一致，不重新解释控制器的输入/输出语义。位/字类型不匹配、未知端口、空范围、越界或写入只读端口返回 `invalid_argument`。FANUC 的地址及报文长度限制仍适用；位读取负责对齐和解包，业务层不需要处理 payload 或位偏移。
+
+`robot/types.hpp` 提供共享的 `Error`、`Result<T>`；原 `fanuc::snpx::Error`、`fanuc::snpx::Result<T>` 是它们的兼容别名，错误码不变。
+
+新增品牌应继承 `robot::RobotDriver`，实现全部纯虚方法，遵守同步返回、0 起始索引、类型检查、只读输入、错误显式返回等契约；不支持的端口应返回带说明的 `invalid_argument`，不能伪装成成功。不把 SNP-X `Message`、`Segment` 或 ASG 纳入通用基类。专有功能继续直接使用各品牌底层客户端。
+
+`FanucDriver` 沿用原客户端的生命周期和安全限制：连接仍清空 ASG；连接、断开和析构必须由应用串行管理，不能与读写并发；写入成功只表示收到应答，不证明物理动作完成。不提供运动控制或安全联锁。
 
 ## 1. 实现功能概览
 
