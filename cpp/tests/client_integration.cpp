@@ -1,4 +1,5 @@
 #include "fanuc_snpx/client.hpp"
+#include "fanuc_snpx/fanuc_driver.hpp"
 
 #include <algorithm>
 #include <array>
@@ -159,7 +160,103 @@ static void normal_session(Client& client) {
     assert(!client.register_asg("$TEST.$VALUE", 2));
 }
 
+static void driver_session(robot::RobotDriver& driver) {
+    Controller controller([](TestSocket peer) {
+        handshake(peer);
+        for (auto segment : {Segment::output_bit, Segment::input_bit}) {
+            for (std::size_t offset = 0; offset < 8; ++offset) {
+                const auto request = receive(peer);
+                assert(request.segment == segment);
+                assert(request.target_index == 0);
+                assert(request.target_size == (offset == 7 ? 16 : 8));
+                auto response = make_response(static_cast<std::uint8_t>(request.header.sequence1));
+                response.inline_payload[0] = 0x80;
+                response.inline_payload[1] = 1;
+                send_all(peer, encode(response));
+            }
+        }
+        for (auto segment : {Segment::analog_output, Segment::analog_input, Segment::registers}) {
+            const auto request = receive(peer);
+            assert(request.segment == segment);
+            assert(request.target_index == (segment == Segment::registers ? 0 : 1000));
+            assert(request.target_size == 2);
+            auto response = make_response(static_cast<std::uint8_t>(request.header.sequence1));
+            response.inline_payload = {0xff, 0xff, 0x34, 0x12, 0, 0};
+            send_all(peer, encode(response));
+        }
+        const auto bit_write = receive(peer);
+        assert(bit_write.segment == Segment::input_bit);
+        assert(bit_write.target_index == 7 && bit_write.target_size == 2);
+        assert(bit_write.inline_payload[0] == 0x80 && bit_write.inline_payload[1] == 1);
+        reply(peer, bit_write);
+        for (auto segment : {Segment::analog_input, Segment::registers}) {
+            const auto request = receive(peer);
+            assert(request.segment == segment);
+            assert(request.target_index == (segment == Segment::registers ? 0 : 1000));
+            assert(request.target_size == 2);
+            assert(request.inline_payload[0] == 0xff && request.inline_payload[1] == 0xff);
+            assert(request.inline_payload[2] == 0x34 && request.inline_payload[3] == 0x12);
+            reply(peer, request);
+        }
+        const auto last_register = receive(peer);
+        assert(last_register.segment == Segment::registers);
+        assert(last_register.target_index == 65535 && last_register.target_size == 1);
+        reply(peer, last_register);
+
+        const auto short_read = receive(peer);
+        assert(short_read.target_size == 4);
+        auto response = make_response(static_cast<std::uint8_t>(short_read.header.sequence1));
+        response.header.message_type = MessageType::extended_response;
+        response.header.payload_size = 2;
+        response.payload = {1, 0};
+        send_all(peer, encode(response));
+        std::array<std::uint8_t, 1> end{};
+        assert(!read_exact(peer, end));
+    });
+    assert(driver.connect("127.0.0.1", controller.port, 2s));
+    assert(driver.connected());
+    for (auto port : {robot::Port::digital_input, robot::Port::digital_output}) {
+        for (std::size_t offset = 0; offset < 8; ++offset) {
+            const auto bits = driver.read_bits(port, offset, 2);
+            assert(bits && bits->size() == 2);
+            assert((*bits)[0] == (offset == 7));
+            assert((*bits)[1] == (offset >= 6));
+        }
+    }
+    for (auto port : {robot::Port::analog_input, robot::Port::analog_output, robot::Port::registers}) {
+        const auto words = driver.read_words(port, 0, 2);
+        assert((words && *words == std::vector<std::int16_t>{-1, 0x1234}));
+    }
+    const std::array<bool, 2> bits{true, true};
+    assert(driver.write_bits(robot::Port::digital_output, 7, bits));
+    const std::array<std::int16_t, 2> words{-1, 0x1234};
+    assert(driver.write_words(robot::Port::analog_output, 0, words));
+    assert(driver.write_words(robot::Port::registers, 0, words));
+    const auto last_register = driver.read_words(robot::Port::registers, 65535);
+    assert(last_register && last_register->size() == 1);
+    const auto short_read = driver.read_words(robot::Port::registers, 0, 4);
+    assert(!short_read && short_read.error().code == robot::Error::Code::protocol);
+    driver.disconnect();
+    assert(!driver.connected());
+}
+
 int main() {
+    {
+        auto driver = std::make_unique<fanuc::FanucDriver>();
+        std::unique_ptr<robot::RobotDriver> base = std::move(driver);
+        driver_session(*base);
+        driver_session(*base);
+        Controller controller([](TestSocket peer) {
+            handshake(peer);
+            receive(peer);
+            std::array<std::uint8_t, 1> end{};
+            assert(!read_exact(peer, end));
+        });
+        assert(base->connect("127.0.0.1", controller.port, 2s, 40ms));
+        const auto timeout = base->read_bits(robot::Port::digital_output, 0);
+        assert(!timeout && timeout.error().code == robot::Error::Code::timeout);
+        assert(!base->connected());
+    }
     Client client;
     normal_session(client);
     normal_session(client);

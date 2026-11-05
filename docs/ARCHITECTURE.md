@@ -1,8 +1,8 @@
-# FANUC SNPX C++23 架构与依赖说明
+# 多品牌驱动与 FANUC SNPX C++23 架构说明
 
 ## 1. 目标与取舍
 
-工程只实现 FANUC SNP-X 的 TCP HMI 数据访问。设计目标是：协议字节布局可检查、请求生命周期有边界、资源由 RAII 管理、失败显式返回，以及上层工程可通过 CMake 正常集成。
+工程提供品牌无关的机械臂数据访问抽象，目前仅实现 FANUC SNP-X 的 TCP HMI 数据访问。设计目标是：业务代码通过基类替换品牌、协议字节布局可检查、请求生命周期有边界、资源由 RAII 管理、失败显式返回，以及上层工程可通过 CMake 正常集成。不把运动控制或尚未实现的品牌协议加入接口承诺。
 
 使用 Boost.Asio 统一跨平台网络，使用 `co_await` 表达异步解析、连接和按帧接收；使用 C++23 `std::expected::and_then` 串联解码和响应验证，`std::to_underlying` 提取强类型枚举值，配合 `std::span`、`std::format`、ranges 和 `std::jthread` 管理接口与资源。不为单连接客户端引入 JSON、HTTP、消息总线或日志框架。实现仍有明确覆盖范围，不宣称厂商认证或全功能 SNPX 支持。
 
@@ -39,7 +39,11 @@
 ├── cpp/
 │   ├── CMakeLists.txt                # 库、示例、测试、安装导出
 │   ├── cmake/fanuc_snpxConfig.cmake.in
-│   ├── include/fanuc_snpx/client.hpp  # 唯一公共头文件
+│   ├── include/robot/types.hpp       # 品牌无关错误与 expected 别名
+│   ├── include/robot/robot_driver.hpp # 抽象基类与逻辑端口
+│   ├── include/fanuc_snpx/fanuc_driver.hpp # FANUC 派生驱动
+│   ├── include/fanuc_snpx/client.hpp  # 原 SNP-X 底层公共接口
+│   ├── src/fanuc_driver.cpp          # 通用端口映射、同步等待与解包
 │   ├── src/client.cpp                # 协议、端口、会话和 Asio 网络实现
 │   ├── examples/snpx_example.cpp     # 读取 DO1 的命令行程序
 │   └── tests/
@@ -51,7 +55,9 @@
 └── .vscode/settings.json             # CMake 编辑器集成
 ```
 
-当前实现规模适合“一个公共头文件 + 一个实现文件”。逻辑分层通过类型与内部函数完成，不为了层数增加公共抽象或虚拟接口。
+驱动层分为 `robot::RobotDriver` → `fanuc::FanucDriver` → `fanuc::snpx::Client`。第一层使用继承定义品牌无关纯虚接口；第二层通过组合复用现有客户端，不改动 SNP-X 网络和会话逻辑。后续品牌继承同一基类，实现自己的协议适配，不依赖 FANUC 类型。基类有虚析构函数，不可复制、不可移动。
+
+通用接口只抽象连接状态、数字位、模拟字和 16 位寄存器读写，统一 0 起始索引和 `robot::Result<T>`。FANUC 适配层通过端口描述副本归一化索引，复用原有校验、异步请求和编解码函数，等待 future 后返回已解包的值；不为每次调用创建线程。原 Client 保持异步 API 和原生索引，ASG、UOP、原始消息等品牌专有功能不进入基类。错误定义上移至 `robot/types.hpp`，原命名空间保留别名。
 
 `client.hpp` 不包含操作系统头文件，也不暴露 socket 句柄、锁和线程；`Client::Impl` 通过 `std::unique_ptr` 隐藏这些细节。调用方不需要定义 Windows 网络宏。
 
@@ -83,7 +89,7 @@ using Response = Result<Message>;
 using ResponseFuture = std::future<Response>;
 ```
 
-同步 API：`connect` 返回 `Result<void>`，`register_asg` 返回 `Result<uint16_t>`。异步 API：`read`、`write_bits`、`write_words`、`command`、`request` 返回 future，其值本身仍为 expected。
+底层 Client 同步 API：`connect` 返回 `Result<void>`，`register_asg` 返回 `Result<uint16_t>`。异步 API：`read`、`write_bits`、`write_words`、`command`、`request` 返回 future，其值本身仍为 expected。上层 `RobotDriver` / `FanucDriver` 的所有操作同步返回 `Result<T>`，错误原样传播给调用者。
 
 | 错误码 | 含义 | 调用方处理 |
 |---|---|---|
@@ -286,7 +292,7 @@ target_link_libraries(my_app PRIVATE fanuc_snpx::fanuc_snpx)
 
 ## 9. 验证与边界
 
-协议测试覆盖：基础帧布局、固定/扩展请求与响应、每个截断长度、无效消息类型/长度/分片、粘连缓冲区、跨字节位打包、有符号小端字、载荷和端口边界、离线调用。
+协议测试覆盖：基础帧布局、固定/扩展请求与响应、每个截断长度、无效消息类型/长度/分片、粘连缓冲区、跨字节位打包、有符号小端字、载荷和端口边界、离线调用。驱动层另覆盖抽象继承与虚析构、兼容错误别名、端口类型/权限/边界校验、通过基类指针调用全部通用方法、所有位偏移解包、五种端口映射、最高寄存器地址、短响应错误、重连及超时传播；安装包消费者同时验证新旧 API。
 
 集成测试通过基于 Asio 的本地 TCP 模拟控制器覆盖：拆分 INIT_ACK、完整握手、反序合并响应、多线程请求提交、位写入、ASG 注册/缓存冲突/读取/超时断开、重连清除缓存、序号回绕、请求超时、256 个在途请求耗尽、断开使待处理 future 完成、错误 INIT_ACK、握手超时、错误响应类型、未知序号、厂商错误帧与对端关闭。另覆盖主机名解析、拒绝连接后重连、空闲时取消期限、65534 字节扩展响应的分段读取、半帧超时、批量大帧写入期间析构和 future 跨 Client 生命周期完成。
 

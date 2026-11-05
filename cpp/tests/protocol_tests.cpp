@@ -1,4 +1,5 @@
 #include "fanuc_snpx/client.hpp"
+#include "fanuc_snpx/fanuc_driver.hpp"
 
 #include <array>
 #include <cassert>
@@ -7,6 +8,7 @@
 #include <limits>
 #include <iostream>
 #include <ranges>
+#include <type_traits>
 #include <vector>
 
 #undef assert
@@ -18,6 +20,50 @@
 using namespace fanuc::snpx;
 
 int main() {
+    static_assert(std::is_abstract_v<robot::RobotDriver>);
+    static_assert(std::has_virtual_destructor_v<robot::RobotDriver>);
+    static_assert(std::is_base_of_v<robot::RobotDriver, fanuc::FanucDriver>);
+    static_assert(std::is_same_v<Error, robot::Error>);
+    static_assert(std::is_same_v<Result<void>, robot::Result<void>>);
+    {
+        auto driver = std::make_unique<fanuc::FanucDriver>();
+        std::unique_ptr<robot::RobotDriver> base = std::move(driver);
+        assert(!base->connected());
+        const auto invalid = [&](const auto& result) {
+            assert(!result && result.error().code == robot::Error::Code::invalid_argument);
+        };
+        auto offline = base->read_bits(robot::Port::digital_output, 0);
+        assert(!offline && offline.error().code == robot::Error::Code::disconnected);
+        auto offline_words = base->read_words(robot::Port::registers, 0);
+        assert(!offline_words && offline_words.error().code == robot::Error::Code::disconnected);
+        const std::array<bool, 1> bits{true};
+        const std::array<std::int16_t, 1> words{-1};
+        auto offline_write = base->write_bits(robot::Port::digital_output, 0, bits);
+        assert(!offline_write && offline_write.error().code == robot::Error::Code::disconnected);
+        auto offline_word_write = base->write_words(robot::Port::registers, 0, words);
+        assert(!offline_word_write &&
+               offline_word_write.error().code == robot::Error::Code::disconnected);
+        invalid(base->read_bits(robot::Port::registers, 0));
+        invalid(base->read_words(robot::Port::digital_input, 0));
+        invalid(base->read_bits(static_cast<robot::Port>(999), 0));
+        invalid(base->write_bits(robot::Port::digital_input, 0, bits));
+        invalid(base->write_words(robot::Port::analog_input, 0, words));
+        invalid(base->write_bits(robot::Port::registers, 0, bits));
+        invalid(base->write_words(robot::Port::digital_output, 0, words));
+        invalid(base->read_bits(robot::Port::digital_output, 0, 0));
+        invalid(base->read_words(robot::Port::registers, 0, 0));
+        invalid(base->read_bits(robot::Port::digital_output,
+                                std::numeric_limits<std::size_t>::max()));
+        invalid(base->read_words(robot::Port::analog_output, 64536));
+        invalid(base->write_bits(robot::Port::digital_output, 0, {}));
+        invalid(base->write_words(robot::Port::registers, 0, {}));
+        invalid(base->write_words(robot::Port::registers, 65535,
+                                 std::array<std::int16_t, 2>{1, 2}));
+        invalid(base->connect("", 60008));
+        base->disconnect();
+        base->disconnect();
+    }
+
     const auto init = encode(make_init());
     assert(init.size() == fixed_frame_size);
     assert(init[0] == 0 && init[1] == 0);
