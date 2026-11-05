@@ -1,4 +1,34 @@
 {
     "cmake.sourceDirectory": "${workspaceFolder}",
-    "C_Cpp.default.configurationProvider": "ms-vscode.cmake-tools"
+    "cmake.buildDirectory": "${workspaceFolder}/build/${buildType}",
+    "cmake.generator": "Ninja",
+    "cmake.useCMakePresets": "never",
+    "cmake.configureOnOpen": true,
+    "cmake.configureSettings": {
+        "CMAKE_CXX_COMPILER": "/usr/bin/g++-15",
+        "CMAKE_CXX_STANDARD": "23",
+        "CMAKE_CXX_STANDARD_REQUIRED": true,
+        "CMAKE_CXX_EXTENSIONS": false,
+        "CMAKE_EXPORT_COMPILE_COMMANDS": true,
+        "BUILD_TESTING": true,
+        "FANUC_SNPX_BUILD_EXAMPLES": true
+    },
+    "cmake.ctest.testExplorerIntegrationEnabled": true,
+    "C_Cpp.default.configurationProvider": "ms-vscode.cmake-tools",
+    "C_Cpp.default.compilerPath": "/usr/bin/g++-15",
+    "C_Cpp.default.cppStandard": "c++23",
+    "C_Cpp.intelliSenseEngine": "default",
+    "C_Cpp.errorSquiggles": "enabled",
+    "C_Cpp.clang_format_style": "LLVM",
+    "[cpp]": {
+        "editor.defaultFormatter": "ms-vscode.cpptools",
+        "editor.formatOnSave": true,
+        "editor.tabSize": 4,
+        "editor.insertSpaces": true
+    },
+    "files.insertFinalNewline": true,
+    "files.trimTrailingWhitespace": true,
+    "files.watcherExclude": {
+        "**/build/**": true
+    }
 }
