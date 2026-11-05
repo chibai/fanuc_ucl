@@ -1,0 +1,113 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "CMake: configure Debug",
+            "type": "process",
+            "command": "cmake",
+            "args": [
+                "-S", "${workspaceFolder}",
+                "-B", "${workspaceFolder}/build/Debug",
+                "-G", "Ninja",
+                "-DCMAKE_BUILD_TYPE=Debug",
+                "-DCMAKE_CXX_COMPILER=/usr/bin/g++-15",
+                "-DCMAKE_CXX_STANDARD=23",
+                "-DCMAKE_CXX_STANDARD_REQUIRED=ON",
+                "-DCMAKE_CXX_EXTENSIONS=OFF",
+                "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+                "-DBUILD_TESTING=ON",
+                "-DFANUC_SNPX_BUILD_EXAMPLES=ON"
+            ],
+            "problemMatcher": []
+        },
+        {
+            "label": "CMake: build Debug",
+            "type": "process",
+            "command": "cmake",
+            "args": [
+                "--build", "${workspaceFolder}/build/Debug", "--parallel"
+            ],
+            "dependsOn": "CMake: configure Debug",
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": ["$gcc"]
+        },
+        {
+            "label": "CMake: test Debug",
+            "type": "process",
+            "command": "ctest",
+            "args": [
+                "--test-dir", "${workspaceFolder}/build/Debug",
+                "--output-on-failure"
+            ],
+            "dependsOn": "CMake: build Debug",
+            "group": {
+                "kind": "test",
+                "isDefault": true
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "CMake: configure Release",
+            "type": "process",
+            "command": "cmake",
+            "args": [
+                "-S", "${workspaceFolder}",
+                "-B", "${workspaceFolder}/build/Release",
+                "-G", "Ninja",
+                "-DCMAKE_BUILD_TYPE=Release",
+                "-DCMAKE_CXX_COMPILER=/usr/bin/g++-15",
+                "-DCMAKE_CXX_STANDARD=23",
+                "-DCMAKE_CXX_STANDARD_REQUIRED=ON",
+                "-DCMAKE_CXX_EXTENSIONS=OFF",
+                "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+                "-DBUILD_TESTING=ON",
+                "-DFANUC_SNPX_BUILD_EXAMPLES=ON"
+            ],
+            "problemMatcher": []
+        },
+        {
+            "label": "CMake: build Release",
+            "type": "process",
+            "command": "cmake",
+            "args": [
+                "--build", "${workspaceFolder}/build/Release", "--parallel"
+            ],
+            "dependsOn": "CMake: configure Release",
+            "group": "build",
+            "problemMatcher": ["$gcc"]
+        },
+        {
+            "label": "CMake: test Release",
+            "type": "process",
+            "command": "ctest",
+            "args": [
+                "--test-dir", "${workspaceFolder}/build/Release",
+                "--output-on-failure"
+            ],
+            "dependsOn": "CMake: build Release",
+            "group": "test",
+            "problemMatcher": []
+        },
+        {
+            "label": "CMake: clean Debug",
+            "type": "process",
+            "command": "cmake",
+            "args": [
+                "--build", "${workspaceFolder}/build/Debug", "--target", "clean"
+            ],
+            "problemMatcher": []
+        },
+        {
+            "label": "CMake: clean Release",
+            "type": "process",
+            "command": "cmake",
+            "args": [
+                "--build", "${workspaceFolder}/build/Release", "--target", "clean"
+            ],
+            "problemMatcher": []
+        }
+    ]
+}

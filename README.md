@@ -18,6 +18,26 @@ ctest --test-dir build -C Release --output-on-failure
 
 也可使用 `cmake -S cpp -B build/cpp` 独立构建库。
 
+## VS Code（Ubuntu 26.04 / G++ 15.2 / C++23）
+
+仓库自带 `.vscode` 配置，使用系统 `/usr/bin/g++-15`、Ninja 和 GDB。先安装工具：
+
+```sh
+sudo apt-get update
+sudo apt-get install g++-15 cmake ninja-build gdb libboost-dev
+g++-15 --version
+code .
+```
+
+确认编译器版本为预期的 15.2；配置指定 GCC 15 的可执行文件，并不锁定发行版提供的补丁版本。打开**仓库根目录**，安装 VS Code 推荐的 **C/C++** 和 **CMake Tools** 扩展。
+
+- **Ctrl+Shift+B**：配置并构建 Debug；产物位于 `build/Debug/cpp/`。
+- **F5**：默认构建并通过 GDB 调试协议测试；也可在“运行和调试”中选择本地模拟控制器集成测试或 SNP-X 示例。示例会询问控制器地址，**连接会清空 ASG 表**，不要未经确认连接真实设备。
+- **终端 → 运行任务**：选择 `CMake: test Debug`、`CMake: build Release`、`CMake: test Release` 或对应清理任务；Release 产物位于 `build/Release/cpp/`。
+- **CMake Tools**：选择 GCC 15 工具包及 Debug/Release 构建类型；其配置与任务共用对应构建目录。智能提示由 CMake 提供实际编译参数，并生成 `compile_commands.json`；保存 C++ 文件时使用 C/C++ 扩展自带的 clang-format（LLVM 风格）。
+
+若编译器安装路径不同，同时修改 `.vscode/settings.json` 和 `.vscode/tasks.json` 中的 `/usr/bin/g++-15`。更换已有构建目录的编译器或生成器前，先运行 **CMake: Delete Cache and Reconfigure**。这些工作区配置面向上述本机环境；现有 Ubuntu 24.04 Dev Container 默认只有 GCC 13，使用它时也需相应调整编译器路径。
+
 ## 使用
 
 ```cpp
