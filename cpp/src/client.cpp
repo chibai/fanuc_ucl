@@ -3,9 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
-#include <cerrno>
 #include <cmath>
-#include <cstring>
 #include <deque>
 #include <format>
 #include <limits>
@@ -15,43 +13,11 @@
 #include <unordered_map>
 #include <utility>
 
-#ifdef _WIN32
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <winsock2.h>
-#include <ws2tcpip.h>
-using NativeSocket = SOCKET;
-static constexpr NativeSocket invalid_socket = INVALID_SOCKET;
-static int socket_error() { return WSAGetLastError(); }
-static bool would_block(int error) {
-    return error == WSAEWOULDBLOCK || error == WSAEINPROGRESS;
-}
-static bool interrupted(int error) { return error == WSAEINTR; }
-static void close_socket(NativeSocket socket) { closesocket(socket); }
-#else
-#include <arpa/inet.h>
-#include <fcntl.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <sys/select.h>
-#include <sys/socket.h>
-#include <unistd.h>
-using NativeSocket = int;
-static constexpr NativeSocket invalid_socket = -1;
-static int socket_error() { return errno; }
-static bool would_block(int error) {
-    return error == EAGAIN || error == EWOULDBLOCK || error == EINPROGRESS;
-}
-static bool interrupted(int error) { return error == EINTR; }
-static void close_socket(NativeSocket socket) { ::close(socket); }
-#endif
+#include <boost/asio.hpp>
 
 namespace fanuc::snpx {
+namespace asio = boost::asio;
+using Tcp = asio::ip::tcp;
 namespace {
 
 Error make_error(Error::Code code, std::string message) {
@@ -120,8 +86,8 @@ Header client_header(MessageType type, std::uint8_t sequence, Operation operatio
     header.packet_type = type == MessageType::init ? 0 : 2;
     header.sequence1 = sequence;
     header.sequence2 = sequence;
-    header.operation1 = static_cast<std::uint32_t>(operation);
-    header.operation2 = static_cast<std::uint32_t>(operation);
+    header.operation1 = std::to_underlying(operation);
+    header.operation2 = std::to_underlying(operation);
     header.message_type = type;
     header.mailbox_destination = 0x00000e10;
     header.packet_number = type == MessageType::init ? 0 : 1;
@@ -130,11 +96,11 @@ Header client_header(MessageType type, std::uint8_t sequence, Operation operatio
 }
 
 bool valid_message_type(std::uint8_t type) {
-    return type == static_cast<std::uint8_t>(MessageType::init) ||
-           type == static_cast<std::uint8_t>(MessageType::request) ||
-           type == static_cast<std::uint8_t>(MessageType::response) ||
-           type == static_cast<std::uint8_t>(MessageType::extended_request) ||
-           type == static_cast<std::uint8_t>(MessageType::extended_response);
+    return type == std::to_underlying(MessageType::init) ||
+           type == std::to_underlying(MessageType::request) ||
+           type == std::to_underlying(MessageType::response) ||
+           type == std::to_underlying(MessageType::extended_request) ||
+           type == std::to_underlying(MessageType::extended_response);
 }
 
 } // namespace
@@ -143,9 +109,9 @@ Message make_init(bool acknowledgement) {
     Message message;
     message.header.packet_type = acknowledgement ? 1 : 0;
     message.header.operation1 = acknowledgement
-        ? static_cast<std::uint32_t>(Operation::init_finish)
-        : static_cast<std::uint32_t>(Operation::init);
-    message.header.operation2 = static_cast<std::uint32_t>(Operation::init);
+        ? std::to_underlying(Operation::init_finish)
+        : std::to_underlying(Operation::init);
+    message.header.operation2 = std::to_underlying(Operation::init);
     message.header.message_type = MessageType::init;
     message.service = Service::plc_status;
     message.segment = Segment::init;
@@ -219,7 +185,7 @@ std::vector<std::uint8_t> encode(const Message& message) {
     out.insert(out.end(), h.time.begin(), h.time.end());
     append_u8(out, h.unknown5);
     append_u8(out, h.sequence2);
-    append_u8(out, static_cast<std::uint8_t>(h.message_type));
+    append_u8(out, std::to_underlying(h.message_type));
     append_u32(out, h.mailbox_source);
     append_u32(out, h.mailbox_destination);
     append_u8(out, h.packet_number);
@@ -228,8 +194,8 @@ std::vector<std::uint8_t> encode(const Message& message) {
     switch (h.message_type) {
     case MessageType::init:
     case MessageType::request:
-        append_u8(out, static_cast<std::uint8_t>(message.service));
-        append_u8(out, static_cast<std::uint8_t>(message.segment));
+        append_u8(out, std::to_underlying(message.service));
+        append_u8(out, std::to_underlying(message.segment));
         append_u16(out, message.target_index);
         append_u16(out, message.target_size);
         out.insert(out.end(), message.inline_payload.begin(), message.inline_payload.end());
@@ -244,8 +210,8 @@ std::vector<std::uint8_t> encode(const Message& message) {
         out.insert(out.end(), 6, 0);
         append_u8(out, 1);
         append_u8(out, 1);
-        append_u8(out, static_cast<std::uint8_t>(message.service));
-        append_u8(out, static_cast<std::uint8_t>(message.segment));
+        append_u8(out, std::to_underlying(message.service));
+        append_u8(out, std::to_underlying(message.segment));
         append_u16(out, message.target_index);
         append_u16(out, message.target_size);
         out.insert(out.end(), message.payload.begin(), message.payload.end());
@@ -254,8 +220,8 @@ std::vector<std::uint8_t> encode(const Message& message) {
         out.insert(out.end(), 6, 0);
         append_u8(out, 1);
         append_u8(out, 1);
-        append_u8(out, static_cast<std::uint8_t>(message.service));
-        append_u8(out, static_cast<std::uint8_t>(message.segment));
+        append_u8(out, std::to_underlying(message.service));
+        append_u8(out, std::to_underlying(message.segment));
         append_u16(out, message.response_unknown);
         out.insert(out.end(), message.plc_status.begin(), message.plc_status.begin() + 2);
         out.insert(out.end(), message.payload.begin(), message.payload.end());
@@ -439,26 +405,22 @@ struct Client::Impl {
         float multiplier;
     };
 
-    struct PendingWrite {
-        std::vector<std::uint8_t> bytes;
-        std::size_t offset{};
-        std::uint8_t sequence{};
-    };
-
-    NativeSocket socket{invalid_socket};
+    asio::io_context context;
+    Tcp::socket socket{context};
+    Tcp::resolver resolver{context};
+    asio::steady_timer timer{context};
+    std::optional<asio::executor_work_guard<asio::io_context::executor_type>> work;
     std::atomic<bool> live{false};
     std::jthread worker;
     std::mutex mutex;
-    std::deque<PendingWrite> outgoing;
+    std::deque<std::shared_ptr<const std::vector<std::uint8_t>>> outgoing;
+    bool writing{};
     std::unordered_map<std::uint8_t, PendingResponse> pending;
     std::chrono::milliseconds request_timeout{std::chrono::seconds(1)};
     std::uint8_t next_sequence{};
     std::mutex asg_mutex;
     std::unordered_map<std::string, AsgMapping> asg;
     std::uint32_t next_asg_address{1};
-#ifdef _WIN32
-    bool winsock_initialized{};
-#endif
 
     std::optional<std::uint8_t> allocate_sequence() {
         for (unsigned i = 0; i < 256; ++i) {
@@ -487,7 +449,11 @@ struct Client::Impl {
         pending.emplace(sequence, PendingResponse{
             promise, std::chrono::steady_clock::now() + request_timeout,
             message.header.message_type == MessageType::init});
-        outgoing.push_back(PendingWrite{encode(message), 0, sequence});
+        outgoing.push_back(std::make_shared<const std::vector<std::uint8_t>>(encode(message)));
+        asio::post(context, [this] {
+            start_write();
+            arm_timeout();
+        });
         return future;
     }
 
@@ -495,6 +461,7 @@ struct Client::Impl {
         std::unordered_map<std::uint8_t, PendingResponse> waiting;
         {
             std::lock_guard lock(mutex);
+            live.store(false);
             waiting.swap(pending);
             outgoing.clear();
         }
@@ -526,128 +493,131 @@ struct Client::Impl {
         return {};
     }
 
-    void run(std::stop_token stop) {
-        std::vector<std::uint8_t> input;
-        std::array<std::uint8_t, 4096> scratch{};
-        Error terminal = make_error(Error::Code::disconnected, "SNP-X connection closed");
-        while (!stop.stop_requested() && live.load()) {
+    void fail_session(Error error) {
+        fail_all(std::move(error));
+        boost::system::error_code ignored;
+        timer.cancel();
+        socket.close(ignored);
+    }
+
+    static Error network_error(std::string_view operation, boost::system::error_code error) {
+        const auto code = error == asio::error::eof || error == asio::error::connection_reset
+            ? Error::Code::disconnected : Error::Code::io;
+        return make_error(code, std::format("{} failed: {} ({})",
+                                           operation, error.message(), error.value()));
+    }
+
+    void arm_timeout() {
+        std::optional<std::chrono::steady_clock::time_point> deadline;
+        {
+            std::lock_guard lock(mutex);
+            if (!live.load()) return;
+            for (const auto& [sequence, response] : pending) {
+                (void)sequence;
+                if (!deadline || response.deadline < *deadline) deadline = response.deadline;
+            }
+        }
+        timer.cancel();
+        if (!deadline) return;
+        timer.expires_at(*deadline);
+        timer.async_wait([this](boost::system::error_code error) {
+            if (error == asio::error::operation_aborted || !live.load()) return;
+            if (error) {
+                fail_session(network_error("request timer", error));
+                return;
+            }
+            // A queued timer completion may outlive the response that canceled it.
+            bool expired{};
             {
                 std::lock_guard lock(mutex);
                 const auto now = std::chrono::steady_clock::now();
-                if (std::ranges::any_of(pending, [now](const auto& entry) {
-                        return now >= entry.second.deadline;
-                    })) {
-                    // Closing the session prevents a late reply from matching a reused sequence.
-                    terminal = make_error(Error::Code::timeout, "SNP-X request timed out; session invalidated");
-                    live.store(false);
-                    break;
-                }
+                expired = std::ranges::any_of(pending, [now](const auto& entry) {
+                    return now >= entry.second.deadline;
+                });
             }
-            fd_set reads, writes;
-            FD_ZERO(&reads);
-            FD_ZERO(&writes);
-            FD_SET(socket, &reads);
-            {
-                std::lock_guard lock(mutex);
-                if (!outgoing.empty()) FD_SET(socket, &writes);
+            if (expired) {
+                fail_session(make_error(Error::Code::timeout,
+                    "SNP-X request timed out; session invalidated"));
+            } else {
+                arm_timeout();
             }
-            timeval interval{0, 1000};
-#ifdef _WIN32
-            const int selected = select(0, &reads, &writes, nullptr, &interval);
-#else
-            const int selected = select(socket + 1, &reads, &writes, nullptr, &interval);
-#endif
-            if (selected < 0) {
-                if (interrupted(socket_error())) continue;
-                terminal = make_error(Error::Code::io, std::format("select failed ({})", socket_error()));
-                break;
-            }
-            if (selected == 0) continue;
+        });
+    }
 
-            if (FD_ISSET(socket, &writes)) {
-                std::lock_guard lock(mutex);
-                while (!outgoing.empty()) {
-                    auto& front = outgoing.front();
-                    const auto remaining = front.bytes.size() - front.offset;
-#ifdef _WIN32
-                    const int sent = ::send(socket,
-                        reinterpret_cast<const char*>(front.bytes.data() + front.offset),
-                        static_cast<int>(remaining), 0);
-#else
-#ifdef MSG_NOSIGNAL
-                    const auto sent = ::send(socket, front.bytes.data() + front.offset, remaining, MSG_NOSIGNAL);
-#else
-                    const auto sent = ::send(socket, front.bytes.data() + front.offset, remaining, 0);
-#endif
-#endif
-                    if (sent < 0) {
-                        const auto error = socket_error();
-                        if (would_block(error) || interrupted(error)) break;
-                        terminal = make_error(Error::Code::io, std::format("send failed ({})", error));
-                        live.store(false);
-                        break;
-                    }
-                    if (sent == 0) {
-                        terminal = make_error(Error::Code::disconnected, "TCP send returned zero");
-                        live.store(false);
-                        break;
-                    }
-                    front.offset += static_cast<std::size_t>(sent);
-                    if (front.offset == front.bytes.size()) outgoing.pop_front();
+    void start_write() {
+        std::shared_ptr<const std::vector<std::uint8_t>> bytes;
+        {
+            std::lock_guard lock(mutex);
+            if (!live.load() || writing || outgoing.empty()) return;
+            writing = true;
+            bytes = outgoing.front();
+        }
+        // The completion owns the buffer even if disconnect clears the queue.
+        asio::async_write(socket, asio::buffer(*bytes),
+            [this, bytes](boost::system::error_code error, std::size_t) {
+                if (!live.load()) return;
+                if (error) {
+                    fail_session(network_error("send", error));
+                    return;
                 }
-                if (!live.load()) break;
-            }
+                {
+                    std::lock_guard lock(mutex);
+                    outgoing.pop_front();
+                    writing = false;
+                }
+                start_write();
+            });
+    }
 
-            if (FD_ISSET(socket, &reads)) {
-#ifdef _WIN32
-                const int received = ::recv(socket, reinterpret_cast<char*>(scratch.data()),
-                                            static_cast<int>(scratch.size()), 0);
-#else
-                const auto received = ::recv(socket, scratch.data(), scratch.size(), 0);
-#endif
-                if (received == 0) {
-                    terminal = make_error(Error::Code::disconnected, "controller closed the TCP connection");
-                    break;
-                }
-                if (received < 0) {
-                    const auto error = socket_error();
-                    if (would_block(error) || interrupted(error)) continue;
-                    terminal = make_error(Error::Code::io, std::format("recv failed ({})", error));
-                    break;
-                }
-                input.insert(input.end(), scratch.begin(),
-                             scratch.begin() + static_cast<std::ptrdiff_t>(received));
-                while (input.size() >= header_size) {
-                    const auto payload_size = static_cast<std::size_t>(input[4]) |
-                                              (static_cast<std::size_t>(input[5]) << 8);
-                    if (input.size() < fixed_frame_size + payload_size) break;
-                    auto decoded = decode(input);
-                    if (!decoded) {
-                        terminal = decoded.error();
-                        live.store(false);
-                        break;
-                    }
-                    auto [message, consumed] = std::move(*decoded);
-                    input.erase(input.begin(), input.begin() + static_cast<std::ptrdiff_t>(consumed));
-                    if (auto result = finish_response(std::move(message)); !result) {
-                        terminal = result.error();
-                        live.store(false);
-                        break;
-                    }
-                }
-                if (!live.load()) break;
+    asio::awaitable<void> read_loop() {
+        while (live.load()) {
+            std::array<std::uint8_t, header_size> header{};
+            boost::system::error_code error;
+            co_await asio::async_read(socket, asio::buffer(header),
+                asio::redirect_error(asio::use_awaitable, error));
+            if (!live.load()) co_return;
+            if (error) {
+                fail_session(network_error("receive header", error));
+                co_return;
             }
+            const auto length = static_cast<std::size_t>(header[4]) |
+                                (static_cast<std::size_t>(header[5]) << 8);
+            std::vector<std::uint8_t> frame(fixed_frame_size + length);
+            std::ranges::copy(header, frame.begin());
+            co_await asio::async_read(socket,
+                asio::buffer(frame.data() + header_size, frame.size() - header_size),
+                asio::redirect_error(asio::use_awaitable, error));
+            if (!live.load()) co_return;
+            if (error) {
+                fail_session(network_error("receive body", error));
+                co_return;
+            }
+            auto result = decode(frame).and_then([this](auto decoded) {
+                return finish_response(std::move(decoded.first));
+            });
+            if (!result) {
+                fail_session(std::move(result.error()));
+                co_return;
+            }
+            arm_timeout();
         }
-        live.store(false);
-        if (stop.stop_requested()) {
-            terminal = make_error(Error::Code::disconnected, "SNP-X client disconnected");
+    }
+
+    asio::awaitable<Result<void>> establish(
+        std::string host, std::uint16_t port, std::chrono::steady_clock::time_point deadline) {
+        boost::system::error_code error;
+        const auto endpoints = co_await resolver.async_resolve(host, std::to_string(port),
+            asio::redirect_error(asio::use_awaitable, error));
+        if (error) co_return std::unexpected(network_error("resolve", error));
+        if (std::chrono::steady_clock::now() >= deadline) {
+            co_return std::unexpected(make_error(Error::Code::timeout, "SNP-X resolution timed out"));
         }
-#ifdef _WIN32
-        shutdown(socket, SD_BOTH);
-#else
-        shutdown(socket, SHUT_RDWR);
-#endif
-        fail_all(std::move(terminal));
+        co_await asio::async_connect(socket, endpoints,
+            asio::redirect_error(asio::use_awaitable, error));
+        if (error) co_return std::unexpected(network_error("connect", error));
+        socket.set_option(Tcp::no_delay(true), error);
+        if (error) co_return std::unexpected(network_error("TCP_NODELAY", error));
+        co_return Result<void>{};
     }
 };
 
@@ -664,146 +634,34 @@ Result<void> Client::connect(
     }
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     disconnect();
-#ifdef _WIN32
-    WSADATA data{};
-    if (WSAStartup(MAKEWORD(2, 2), &data) != 0) {
-        return std::unexpected(make_error(Error::Code::io, "WSAStartup failed"));
+    impl_->context.restart();
+    bool timed_out{};
+    impl_->timer.expires_at(deadline);
+    impl_->timer.async_wait([&](boost::system::error_code error) {
+        if (error == asio::error::operation_aborted) return;
+        if (error) throw boost::system::system_error(error);
+        timed_out = true;
+        impl_->resolver.cancel();
+        boost::system::error_code ignored;
+        impl_->socket.close(ignored);
+    });
+    Result<void> established;
+    std::exception_ptr establishment_exception;
+    asio::co_spawn(impl_->context, impl_->establish(std::string(host), port, deadline),
+        [&](std::exception_ptr exception, Result<void> result) {
+            establishment_exception = exception;
+            established = std::move(result);
+            impl_->timer.cancel();
+        });
+    impl_->context.run();
+    if (establishment_exception) std::rethrow_exception(establishment_exception);
+    if (timed_out || !established) {
+        boost::system::error_code ignored;
+        impl_->socket.close(ignored);
+        return timed_out
+            ? std::unexpected(make_error(Error::Code::timeout, "SNP-X connection timed out"))
+            : std::unexpected(std::move(established.error()));
     }
-    impl_->winsock_initialized = true;
-#endif
-    addrinfo hints{};
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    addrinfo* addresses{};
-    const std::string host_string(host);
-    const auto port_string = std::to_string(port);
-    const int lookup = getaddrinfo(host_string.c_str(), port_string.c_str(), &hints, &addresses);
-    if (lookup != 0) {
-#ifdef _WIN32
-        WSACleanup();
-        impl_->winsock_initialized = false;
-        return std::unexpected(make_error(Error::Code::io, std::format("getaddrinfo failed ({})", lookup)));
-#else
-        return std::unexpected(make_error(Error::Code::io, gai_strerror(lookup)));
-#endif
-    }
-
-    NativeSocket connected_socket = invalid_socket;
-    std::string last_error = "no address resolved";
-    for (auto* address = addresses; address; address = address->ai_next) {
-        auto candidate = ::socket(address->ai_family, address->ai_socktype, address->ai_protocol);
-        if (candidate == invalid_socket) {
-            last_error = std::format("socket failed ({})", socket_error());
-            continue;
-        }
-#ifdef _WIN32
-        u_long nonblocking = 1;
-        if (ioctlsocket(candidate, FIONBIO, &nonblocking) != 0) {
-            last_error = std::format("setting nonblocking socket failed ({})", socket_error());
-            close_socket(candidate);
-            continue;
-        }
-        const int result = ::connect(candidate, address->ai_addr, static_cast<int>(address->ai_addrlen));
-        if (result == SOCKET_ERROR && socket_error() != WSAEWOULDBLOCK && socket_error() != WSAEINPROGRESS) {
-#else
-        if (candidate >= FD_SETSIZE) {
-            last_error = "socket descriptor exceeds select FD_SETSIZE";
-            close_socket(candidate);
-            continue;
-        }
-        const int flags = fcntl(candidate, F_GETFL, 0);
-        if (flags < 0 || fcntl(candidate, F_SETFL, flags | O_NONBLOCK) < 0) {
-            last_error = std::format("setting nonblocking socket failed ({})", socket_error());
-            close_socket(candidate);
-            continue;
-        }
-        const int result = ::connect(candidate, address->ai_addr, address->ai_addrlen);
-        if (result < 0 && errno != EINPROGRESS) {
-#endif
-            last_error = std::format("connect failed ({})", socket_error());
-            close_socket(candidate);
-            continue;
-        }
-        fd_set writable;
-        fd_set exceptional;
-        FD_ZERO(&writable);
-        FD_ZERO(&exceptional);
-        FD_SET(candidate, &writable);
-        FD_SET(candidate, &exceptional);
-        const auto now = std::chrono::steady_clock::now();
-        if (now >= deadline) {
-            last_error = "TCP connect timed out";
-            close_socket(candidate);
-            break;
-        }
-        const auto timeout_ms =
-            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
-        timeval wait{
-            static_cast<long>(timeout_ms / 1000),
-            static_cast<long>((timeout_ms % 1000) * 1000)};
-#ifdef _WIN32
-        const int selected = select(0, nullptr, &writable, &exceptional, &wait);
-#else
-        const int selected = select(candidate + 1, nullptr, &writable, &exceptional, &wait);
-#endif
-        if (selected <= 0) {
-            last_error = selected == 0 ? "TCP connect timed out" :
-                std::format("connect select failed ({})", socket_error());
-            close_socket(candidate);
-            continue;
-        }
-        int so_error{};
-#ifdef _WIN32
-        int option_len = sizeof(so_error);
-#else
-        socklen_t option_len = sizeof(so_error);
-#endif
-        if (getsockopt(candidate, SOL_SOCKET, SO_ERROR,
-#ifdef _WIN32
-                       reinterpret_cast<char*>(&so_error),
-#else
-                       &so_error,
-#endif
-                       &option_len) != 0 || so_error != 0) {
-            last_error = std::format("TCP connect failed ({})", so_error == 0 ? socket_error() : so_error);
-            close_socket(candidate);
-            continue;
-        }
-        connected_socket = candidate;
-        break;
-    }
-    freeaddrinfo(addresses);
-    if (connected_socket == invalid_socket) {
-#ifdef _WIN32
-        WSACleanup();
-        impl_->winsock_initialized = false;
-#endif
-        return std::unexpected(make_error(Error::Code::io, std::move(last_error)));
-    }
-#ifdef _WIN32
-    BOOL no_delay = TRUE;
-    const int configured = setsockopt(connected_socket, IPPROTO_TCP, TCP_NODELAY,
-                                     reinterpret_cast<const char*>(&no_delay), sizeof(no_delay));
-#else
-    const int no_delay = 1;
-    int configured = setsockopt(connected_socket, IPPROTO_TCP, TCP_NODELAY, &no_delay, sizeof(no_delay));
-#ifdef SO_NOSIGPIPE
-    const int no_sigpipe = 1;
-    if (configured == 0) {
-        configured = setsockopt(connected_socket, SOL_SOCKET, SO_NOSIGPIPE, &no_sigpipe, sizeof(no_sigpipe));
-    }
-#endif
-#endif
-    if (configured != 0) {
-        const auto error = make_error(Error::Code::io, std::format("socket configuration failed ({})", socket_error()));
-        close_socket(connected_socket);
-#ifdef _WIN32
-        WSACleanup();
-        impl_->winsock_initialized = false;
-#endif
-        return std::unexpected(error);
-    }
-    impl_->socket = connected_socket;
     impl_->next_sequence = 0;
     impl_->request_timeout = timeout;
     {
@@ -812,7 +670,20 @@ Result<void> Client::connect(
         impl_->next_asg_address = 1;
     }
     impl_->live.store(true);
-    impl_->worker = std::jthread([state = impl_.get()](std::stop_token stop) { state->run(stop); });
+    impl_->writing = false;
+    impl_->context.restart();
+    impl_->work.emplace(asio::make_work_guard(impl_->context));
+    asio::co_spawn(impl_->context, impl_->read_loop(),
+        [state = impl_.get()](std::exception_ptr exception) {
+            if (!exception) return;
+            try {
+                std::rethrow_exception(exception);
+            } catch (const std::exception& error) {
+                state->fail_session(make_error(Error::Code::io,
+                    std::format("SNP-X receive task failed: {}", error.what())));
+            }
+        });
+    impl_->worker = std::jthread([state = impl_.get()] { state->context.run(); });
 
     const auto await = [&](ResponseFuture future) -> Result<Message> {
         const auto now = std::chrono::steady_clock::now();
@@ -841,34 +712,22 @@ Result<void> Client::connect(
         disconnect();
         return std::unexpected(std::move(error));
     }
-    impl_->request_timeout = request_timeout;
+    {
+        std::lock_guard lock(impl_->mutex);
+        impl_->request_timeout = request_timeout;
+    }
     return {};
 }
 
 void Client::disconnect() noexcept {
     if (!impl_) return;
-    if (impl_->worker.joinable()) impl_->worker.request_stop();
-    impl_->live.store(false);
-    if (impl_->socket != invalid_socket) {
-#ifdef _WIN32
-        shutdown(impl_->socket, SD_BOTH);
-#else
-        shutdown(impl_->socket, SHUT_RDWR);
-#endif
-    }
     if (impl_->worker.joinable()) {
+        asio::post(impl_->context, [state = impl_.get()] {
+            state->fail_session(make_error(Error::Code::disconnected, "SNP-X client disconnected"));
+            state->work.reset();
+        });
         impl_->worker.join();
     }
-    if (impl_->socket != invalid_socket) {
-        close_socket(impl_->socket);
-        impl_->socket = invalid_socket;
-    }
-#ifdef _WIN32
-    if (impl_->winsock_initialized) {
-        WSACleanup();
-        impl_->winsock_initialized = false;
-    }
-#endif
 }
 
 bool Client::connected() const noexcept {

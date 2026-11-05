@@ -21,7 +21,7 @@
 #include <fanuc_snpx/client.hpp>
 ```
 
-使用 `fanuc_snpx::fanuc_snpx` CMake target（别名 `fanuc_snpx::fanuc_snpx`），目标会传播 C++23、线程依赖和 Windows 所需的网络库。独立工程可通过 `add_subdirectory` 或安装后 `find_package(fanuc_snpx CONFIG REQUIRED)` 集成，完整命令见 [README](../README.md#集成)。
+使用 `fanuc_snpx::fanuc_snpx` CMake target，目标会传播 C++23、线程依赖和 Windows 所需的网络库。网络实现使用 Boost.Asio，构建和安装包消费者需要 Boost ≥ 1.74 头文件，但公共 API 不暴露 Boost 类型。独立工程可通过 `add_subdirectory` 或安装后 `find_package(fanuc_snpx CONFIG REQUIRED)` 集成，完整命令见 [README](../README.md#集成)。
 
 命名空间为 `fanuc::snpx`。公共头文件不暴露操作系统 socket 类型。
 
@@ -149,7 +149,7 @@ Result<void> connect(
 - `host` 必须非空且不含 NUL；`port` 和两个超时必须大于 0。
 - `timeout` 用于 TCP 连接和整个握手预算；`request_timeout` 是握手成功后每个请求的期限。
 - 成功前依次进行 INIT、MAGIC、`CLRASG`。成功时 ASG 表已清空；重新连接需重新注册 ASG。
-- 建连或握手失败返回 `Error` 并清理连接。DNS 的 `getaddrinfo` 是同步调用，不能由连接超时中断。
+- 建连或握手失败返回 `Error` 并清理连接。Asio 异步解析、TCP 连接和握手共享总预算；超时取消解析并关闭 socket。底层系统 DNS 解析的取消清理仍可能延迟返回，不保证硬实时期限。
 
 ### `disconnect` / `connected`
 
