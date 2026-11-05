@@ -4,26 +4,26 @@
 
 工程只实现 FANUC SNP-X 的 TCP HMI 数据访问。设计目标是：协议字节布局可检查、请求生命周期有边界、资源由 RAII 管理、失败显式返回，以及上层工程可通过 CMake 正常集成。
 
-“C++23 范式”不意味着把所有新语法或第三方库都加入项目。这里选择 `std::expected`、`std::span`、`std::jthread` 等能直接改善接口契约的工具，不为单连接客户端引入协程框架、JSON、HTTP、消息总线或日志框架。实现仍有明确覆盖范围，不宣称厂商认证或全功能 SNPX 支持。
+使用 Boost.Asio 统一跨平台网络，使用 `co_await` 表达异步解析、连接和按帧接收；使用 C++23 `std::expected::and_then` 串联解码和响应验证，`std::to_underlying` 提取强类型枚举值，配合 `std::span`、`std::format`、ranges 和 `std::jthread` 管理接口与资源。不为单连接客户端引入 JSON、HTTP、消息总线或日志框架。实现仍有明确覆盖范围，不宣称厂商认证或全功能 SNPX 支持。
 
 ## 2. 组件与库选型
 
 | 职责 | 实际使用 | 原因与边界 |
 |---|---|---|
-| TCP 网络 | Linux/POSIX Socket；Windows Winsock2 (`ws2_32`) | 无第三方运行库；仅维护一条 TCP 连接，平台差异集中在实现文件 |
-| I/O 就绪通知 | 操作系统 `select` | 单 socket 足够；1ms 轮询间隔，不是硬实时调度保证 |
+| TCP 网络 | Boost.Asio `ip::tcp::socket`、`resolver` | 统一 Linux/Windows 实现，头文件模式，无 Boost 二进制链接依赖 |
+| I/O 调度 | `io_context`、`async_read` / `async_write`、`awaitable` | 事件驱动，不再做 1ms 轮询；单线程 executor 串行操作 socket |
 | JSON | **不使用任何 JSON 库** | SNPX 是小端二进制帧，不是 JSON 协议；当前没有 JSON 配置或 REST 接口 |
 | 二进制编解码 | 自有显式字节编码 + `std::span`、`std::bit_cast` | 不依赖结构体填充、宿主字节序或未对齐内存访问 |
 | 可预期错误 | `std::expected<T, Error>` / `std::unexpected` | 连接、协议、输入校验等失败需要调用方显式处理 |
 | 异步结果 | `std::promise` / `std::future` | 每个请求对应一次完成，调用方可等待或轮询 |
-| 后台任务 | `std::jthread` / `std::stop_token` | 连接对象管理线程；销毁时停止并 join，不使用 detached 线程 |
+| 后台任务 | `std::jthread`、Asio work guard | 连接对象管理线程；销毁时取消 I/O、释放 guard 并 join，不使用 detached 线程 |
 | 共享状态 | `std::mutex`、`std::atomic<bool>` | 队列/序号表互斥；在线状态原子读取 |
-| 超时 | `std::chrono::steady_clock` | 不受系统墙上时间校准影响 |
+| 超时 | `asio::steady_timer` + `std::chrono::steady_clock` | 调度最近的请求期限，不受系统墙上时间校准影响 |
 | 命令格式化 | `std::format` | 使用标准库，不依赖 fmt；ASG 倍率不受用户 locale 格式影响 |
-| 构建/分发 | CMake、CTest、`Threads::Threads` | 编译要求通过目标传播，支持子目录与安装包集成 |
+| 构建/分发 | CMake、CTest、`Threads::Threads`、`Boost::headers` | 编译要求通过目标传播，支持子目录与安装包集成 |
 | 测试 | C++ 测试可执行文件 + 本地 TCP 模拟控制器 | 无测试框架依赖；断言在 Release 下仍生效 |
 
-不使用 Asio/Boost.Asio、nlohmann/json、JsonCpp、fmt 或 spdlog。开发容器和 VS Code 的 `.json` 文件是工具配置，不会被客户端解析，也不构成 JSON 运行时依赖。CMake 自身在操作系统上的依赖也不是 `fanuc_snpx` 的链接依赖。
+`std::asio` 不是 C++23 标准库设施，本项目明确使用 `boost::asio`。不使用 nlohmann/json、JsonCpp、fmt 或 spdlog。开发容器和 VS Code 的 `.json` 文件是工具配置，不会被客户端解析，也不构成 JSON 运行时依赖。
 
 若未来确有“JSON 配置文件”需求，应在独立应用层选择解析库并校验字段，不改变 SNPX 线上格式；目前不预埋未被使用的依赖。
 
@@ -40,7 +40,7 @@
 │   ├── CMakeLists.txt                # 库、示例、测试、安装导出
 │   ├── cmake/fanuc_snpxConfig.cmake.in
 │   ├── include/fanuc_snpx/client.hpp  # 唯一公共头文件
-│   ├── src/client.cpp                # 协议、端口、会话和平台网络实现
+│   ├── src/client.cpp                # 协议、端口、会话和 Asio 网络实现
 │   ├── examples/snpx_example.cpp     # 读取 DO1 的命令行程序
 │   └── tests/
 │       ├── protocol_tests.cpp        # 字节布局、编解码、边界校验
@@ -55,7 +55,7 @@
 
 `client.hpp` 不包含操作系统头文件，也不暴露 socket 句柄、锁和线程；`Client::Impl` 通过 `std::unique_ptr` 隐藏这些细节。调用方不需要定义 Windows 网络宏。
 
-`client.cpp` 内部按职责分为：平台 socket 适配、字节 Reader/Writer、消息工厂与编解码、位/字编解码、`Client::Impl` I/O 调度、公共 Client API。
+`client.cpp` 内部按职责分为：字节 Reader/Writer、消息工厂与编解码、位/字编解码、`Client::Impl` Asio I/O 调度、公共 Client API。
 
 ## 4. C++23 类型与所有权
 
@@ -111,9 +111,9 @@ auto result = client.connect(
 );
 ```
 
-默认两种超时均为 1 秒，必须为正。传入 IP 或主机名，内部使用 `getaddrinfo` 得到地址列表，逐一尝试非阻塞连接，以 `select` 和 `SO_ERROR` 确认建连结果。POSIX 文件描述符超过 `FD_SETSIZE` 时明确失败，避免越界写入 fd_set。
+默认两种超时均为 1 秒，必须为正。传入 IP 或主机名，内部通过 `resolver.async_resolve` 解析地址列表，再由 `async_connect` 逐一尝试连接。解析和连接通过 `co_await` 串联，由同一个 `steady_timer` 限制总预算，无手工 fd_set 或平台 socket 句柄。
 
-**DNS 限制：`getaddrinfo` 是同步系统调用，不能被上述超时中断。** 总预算从调用开始计算，但解析阻塞时墙钟耗时可能超过预算；严格要求连接时限时应传入已解析的数值 IP。请求期限也不是硬实时保证，会受到线程调度、网络与锁竞争影响。
+超时会取消 resolver 并关闭 socket，返回 `timeout`，解析完成后也会重新检查期限，避免在过期后开始连接。**DNS 限制：Asio 底层系统解析的取消清理可能延迟完成，因此不保证墙钟硬实时期限。** 请求期限也会受到线程调度、网络与锁竞争影响。
 
 连接成功后启用 `TCP_NODELAY`，启动一个 I/O 线程；INIT → MAGIC → CLRASG 成功才返回成功。在 `connect` 尚未返回时，不得从其他线程使用该 Client。
 
@@ -124,31 +124,30 @@ auto result = client.connect(
   -> 校验参数
   -> mutex 下分配空闲序号
   -> 创建 promise / future
-  -> 编码并放入 outgoing
+  -> 编码并放入 outgoing，post 唤醒 executor
   -> 返回 future
 后台线程
-  -> select 等待可写
-  -> send，保留部分写入 offset
-  -> 完整发送后移除 outgoing 项
+  -> async_write 发送队首完整帧
+  -> 完成后移除 outgoing 项，再发送下一帧
 ```
 
-一个请求从入队开始计时，排队时间也属于期限。序号表包含所有在途请求，最多 256 项。`send` 可能只写入一部分，不能假定一次调用发送整帧。
+一个请求从入队开始计时，排队时间也属于期限。序号表包含所有在途请求，最多 256 项。`async_write` 是组合操作，处理部分写入；同一 socket 同时只允许一个写操作，防止帧交错。
 
-发送使用非阻塞 socket；暂不可写时稍后继续。POSIX 使用 `MSG_NOSIGNAL` 或平台可用的 `SO_NOSIGPIPE`，避免对已关闭 socket 写入导致进程收到 SIGPIPE。发送、接收和循环中的 `select` 被信号中断时会重试。
+Asio 负责平台非阻塞 I/O、就绪通知及平台错误处理。写完成处理器持有编码缓冲区的共享所有权；即使断开清空队列，缓冲区仍存活到取消完成，避免异步 I/O 悬空引用。
 
 ### 5.3 接收
 
-后台线程持有接收字节缓冲区，按完整帧长度提取消息。一次 `recv` 可能只是半帧，也可能包含多个响应；解析与 TCP 分段无关。
+后台协程先 `async_read` 完整 42 字节头，再按 payload_size 读取固定体和扩展载荷，最后解码并匹配请求。组合读操作处理半帧；粘连响应按帧依次读取，解析与 TCP 分段无关。
 
 请求序号在互斥区内分配和释放，响应按序号匹配，允许乱序。匹配时验证初始化消息或普通响应类型；无法归属的响应和非法报文会使会话失败，而不是悄悄丢弃。
 
 ### 5.4 结束与超时
 
-每个请求持有 `steady_clock` deadline。任何一个超时都会使连接失效，对 socket 执行 shutdown，并让所有待处理 future 以 timeout 完成。这是有意采用的保守策略：8 位序号没有会话世代，继续使用同一连接无法可靠区分迟到响应和已复用序号的新请求。
+每个请求持有 `steady_clock` deadline，`steady_timer` 调度最近期限。任何一个超时都会使连接失效，关闭 socket 取消 I/O，并让所有待处理 future 以 timeout 完成。这是有意采用的保守策略：8 位序号没有会话世代，继续使用同一连接无法可靠区分迟到响应和已复用序号的新请求。定时器完成时重新检查在途期限，避免已经排队的旧完成事件误伤新请求。
 
 `future.wait_for` **只等待，不取消请求**。例如调用方等 50ms 超时，而请求期限为 250ms，请求仍可能在剩余时间内被控制器执行。不能据此自动重试输出写入。
 
-主动 `disconnect` 的顺序是：请求线程停止 → 标记离线 → shutdown 唤醒 socket → join → 关闭句柄 → 清理 Winsock。所有未完成请求以 disconnected 完成；调用方丢弃 future 也不会取消控制器操作。
+主动 `disconnect` 将关闭任务 post 到 executor：标记离线并完成待处理请求 → 取消 timer 并关闭 socket → 释放 work guard → 执行取消完成处理器 → join。所有 socket 操作在同一 executor 上串行完成；Asio 自动管理平台网络资源。所有未完成请求以 disconnected 完成；调用方丢弃 future 也不会取消控制器操作。
 
 没有后台自动重连或自动重发，避免在不确定控制器是否已执行的情况下重复写入。
 
@@ -160,7 +159,7 @@ auto result = client.connect(
 
 `connected()` 只是瞬时观测，不保证下一次请求成功。网络可以在检查之后立刻断开，必须处理 future 中的错误。
 
-不提供用户回调执行器、线程池、协程 awaitable 或事件总线；若应用需要，可在上层统一调度 future，不必改变协议层。
+协程仅用于内部网络实现，公共 API 保留 future，不暴露 Boost 类型或执行器。work guard 保持后台 executor 存活；会话失败后线程空闲等待显式 disconnect，不轮询、不自动重连。
 
 ## 7. 编解码和调用示例
 
@@ -236,11 +235,12 @@ if (!response) {
 
 ## 8. 构建与安装集成
 
-无第三方库需要下载，配置过程不使用 FetchContent、vcpkg 或 Conan。需要操作系统网络库和 C++ 标准库。
+需要预先安装 Boost ≥ 1.74 头文件，CMake 通过 `find_package(Boost)` 查找，不自动下载依赖。Asio 与 Boost.System 使用头文件模式；Windows 系统网络库仍由目标链接。安装包通过 `find_dependency(Boost)` 重新查找消费者的 Boost。
 
 Linux：
 
 ```sh
+sudo apt-get install cmake libboost-dev
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
 ctest --test-dir build --output-on-failure
@@ -249,6 +249,8 @@ cmake --install build --prefix install
 
 Windows（Visual Studio 开发终端）：
 
+先安装 Boost 并设置 `BOOST_ROOT`；也可使用 vcpkg `boost-asio` 和相应 CMake toolchain。
+
 ```powershell
 cmake -S . -B build
 cmake --build build --config Release --parallel
@@ -256,7 +258,7 @@ ctest --test-dir build -C Release --output-on-failure
 cmake --install build --config Release --prefix install
 ```
 
-需要完整实现 `std::expected` 与 `std::format` 的编译器及标准库。仅指定 `-std=c++23` 不能弥补旧标准库缺少这些设施。推荐 GCC 13+ / libstdc++ 13+ 或 VS 2022 17.8+。其他平台没有在当前 CI 中作兼容性承诺。
+需要协程及完整实现 `std::expected`（含 `and_then`）与 `std::format`、`std::to_underlying` 的编译器及标准库。仅指定 `-std=c++23` 不能弥补旧标准库缺少这些设施。推荐 GCC 13+ / libstdc++ 13+ 或 VS 2022 17.8+。其他平台没有在当前 CI 中作兼容性承诺。
 
 支持以下选项：
 
@@ -286,7 +288,7 @@ target_link_libraries(my_app PRIVATE fanuc_snpx::fanuc_snpx)
 
 协议测试覆盖：基础帧布局、固定/扩展请求与响应、每个截断长度、无效消息类型/长度/分片、粘连缓冲区、跨字节位打包、有符号小端字、载荷和端口边界、离线调用。
 
-集成测试通过本地 TCP 模拟控制器覆盖：拆分 INIT_ACK、完整握手、反序合并响应、多线程请求提交、位写入、ASG 注册/缓存冲突/读取/超时断开、重连清除缓存、序号回绕、请求超时、256 个在途请求耗尽、断开使待处理 future 完成、错误 INIT_ACK、握手超时、错误响应类型、未知序号、厂商错误帧与对端关闭。
+集成测试通过基于 Asio 的本地 TCP 模拟控制器覆盖：拆分 INIT_ACK、完整握手、反序合并响应、多线程请求提交、位写入、ASG 注册/缓存冲突/读取/超时断开、重连清除缓存、序号回绕、请求超时、256 个在途请求耗尽、断开使待处理 future 完成、错误 INIT_ACK、握手超时、错误响应类型、未知序号、厂商错误帧与对端关闭。另覆盖主机名解析、拒绝连接后重连、空闲时取消期限、65534 字节扩展响应的分段读取、半帧超时、批量大帧写入期间析构和 future 跨 Client 生命周期完成。
 
 CI 在 Linux/Windows 的 Debug/Release 构建并运行测试，安装后再通过独立消费者工程验证 `find_package` 与链接；Linux 另运行 AddressSanitizer 和 UndefinedBehaviorSanitizer。主工程测试有 CTest 级超时，断言不因 `NDEBUG` 被禁用。
 

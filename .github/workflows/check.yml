@@ -18,6 +18,16 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - name: Install Boost (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libboost-dev
+      - name: Locate Boost (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $boost = Get-ChildItem Env: | Where-Object Name -Like 'BOOST_ROOT_*' | Select-Object -First 1
+          if (-not $boost) { throw "Boost headers are not installed on this runner" }
+          "BOOST_ROOT=$($boost.Value)" >> $env:GITHUB_ENV
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ matrix.configuration }}
       - name: Build
@@ -40,6 +50,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - name: Install Boost
+        run: sudo apt-get update && sudo apt-get install -y libboost-dev
       - name: Configure
         run: >-
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug

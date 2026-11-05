@@ -2,11 +2,13 @@
 
 专注于 FANUC SNPX（SNP-X）HMI 数据访问的 C++23 客户端，默认使用 TCP `60008`。工程仅保留 SNPX：帧编解码、连接握手、异步请求、位/字端口读写和 ASG 变量映射。
 
-**依赖选型：网络使用原生 POSIX Socket / Windows Winsock2；并发、错误和格式化使用 C++23 标准库；不使用 JSON 库。** SNPX 使用二进制帧，JSON 不属于其传输格式。
+**依赖选型：网络统一使用 Boost.Asio；错误和格式化使用 C++23 标准库；不使用 JSON 库。** Asio 异步 I/O、`co_await` 协程和定时器替代平台 socket 代码与轮询；公共接口保留 `std::future<std::expected<…>>`。SNPX 使用二进制帧，JSON 不属于其传输格式。`std::asio` 不属于 C++23 标准库，本项目使用 `boost::asio`。
 
 ## 构建
 
-需要 CMake ≥ 3.25，以及支持 `std::expected`、`std::format`、`std::jthread` 的编译器和标准库。推荐 GCC 13+ / libstdc++ 13+，或 Visual Studio 2022 17.8+。Linux 和 Windows 已配置 CI；其他工具链需自行验证标准库支持。
+需要 CMake ≥ 3.25、Boost ≥ 1.74 的头文件，以及支持协程、`std::expected`（含单子操作）、`std::format`、`std::to_underlying`、`std::jthread` 的编译器和标准库。推荐 GCC 13+ / libstdc++ 13+，或 Visual Studio 2022 17.8+。Linux 和 Windows 已配置 CI；其他工具链需自行验证标准库支持。
+
+Ubuntu 可先安装 `sudo apt-get install cmake libboost-dev`。Windows 可设置 `BOOST_ROOT` 指向 Boost 安装目录，或使用 `-DCMAKE_TOOLCHAIN_FILE=…/vcpkg.cmake` 和 vcpkg 的 `boost-asio` 包。Asio 与 Boost.System 使用头文件模式，无需单独链接 Boost 二进制库。
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release

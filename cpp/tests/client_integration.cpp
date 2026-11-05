@@ -9,52 +9,33 @@
 #include <limits>
 #include <thread>
 
+#include <boost/asio.hpp>
+
 #undef assert
 #define assert(expression) do { if (!(expression)) { \
     std::cerr << __FILE__ << ':' << __LINE__ << ": " << #expression << '\n'; \
     std::abort(); \
 } } while (false)
 
-#ifdef _WIN32
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <winsock2.h>
-#include <ws2tcpip.h>
-using TestSocket = SOCKET;
-static constexpr TestSocket invalid_socket = INVALID_SOCKET;
-static void close_socket(TestSocket socket) { closesocket(socket); }
-#else
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <sys/socket.h>
-#include <unistd.h>
-using TestSocket = int;
-static constexpr TestSocket invalid_socket = -1;
-static void close_socket(TestSocket socket) { close(socket); }
-#endif
+namespace asio = boost::asio;
+using Tcp = asio::ip::tcp;
+using TestSocket = Tcp::socket&;
 
 using namespace fanuc::snpx;
 using namespace std::chrono_literals;
 
 static bool read_exact(TestSocket socket, std::span<std::uint8_t> buffer) {
-    while (!buffer.empty()) {
-        const auto count = recv(socket, reinterpret_cast<char*>(buffer.data()),
-                                static_cast<int>(buffer.size()), 0);
-        if (count <= 0) return false;
-        buffer = buffer.subspan(static_cast<std::size_t>(count));
-    }
-    return true;
+    boost::system::error_code error;
+    asio::read(socket, asio::buffer(buffer.data(), buffer.size()), error);
+    if (error == asio::error::eof || error == asio::error::connection_reset) return false;
+    assert(!error);
+    return !error;
 }
 
 static void send_all(TestSocket socket, std::span<const std::uint8_t> buffer) {
-    while (!buffer.empty()) {
-        const auto count = send(socket, reinterpret_cast<const char*>(buffer.data()),
-                                static_cast<int>(buffer.size()), 0);
-        assert(count > 0);
-        buffer = buffer.subspan(static_cast<std::size_t>(count));
-    }
+    boost::system::error_code error;
+    asio::write(socket, asio::buffer(buffer.data(), buffer.size()), error);
+    assert(!error);
 }
 
 static Message receive(TestSocket socket) {
@@ -91,41 +72,25 @@ static void handshake(TestSocket socket) {
 
 class Controller {
 public:
-    explicit Controller(std::function<void(TestSocket)> serve) {
-        listener_ = ::socket(AF_INET, SOCK_STREAM, 0);
-        assert(listener_ != invalid_socket);
-        sockaddr_in address{};
-        address.sin_family = AF_INET;
-        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        assert(bind(listener_, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0);
-        assert(listen(listener_, 1) == 0);
-#ifdef _WIN32
-        int size = sizeof(address);
-#else
-        socklen_t size = sizeof(address);
-#endif
-        assert(getsockname(listener_, reinterpret_cast<sockaddr*>(&address), &size) == 0);
-        port = ntohs(address.sin_port);
+    explicit Controller(std::function<void(TestSocket)> serve)
+        : listener_(context_, Tcp::endpoint(asio::ip::address_v4::loopback(), 0)) {
+        port = listener_.local_endpoint().port();
         worker_ = std::jthread([this, serve = std::move(serve)] {
-            const auto peer = accept(listener_, nullptr, nullptr);
-            assert(peer != invalid_socket);
-            const int enabled = 1;
-            assert(setsockopt(peer, IPPROTO_TCP, TCP_NODELAY,
-                             reinterpret_cast<const char*>(&enabled), sizeof(enabled)) == 0);
+            auto peer = listener_.accept();
+            peer.set_option(Tcp::no_delay(true));
             serve(peer);
-            close_socket(peer);
         });
     }
 
     ~Controller() {
         worker_.join();
-        close_socket(listener_);
     }
 
     std::uint16_t port{};
 
 private:
-    TestSocket listener_{invalid_socket};
+    asio::io_context context_;
+    Tcp::acceptor listener_;
     std::jthread worker_;
 };
 
@@ -168,7 +133,7 @@ static void normal_session(Client& client) {
         std::array<std::uint8_t, 1> end{};
         assert(!read_exact(peer, end));
     });
-    assert(client.connect("127.0.0.1", controller.port, 2s));
+    assert(client.connect("localhost", controller.port, 2s));
     auto first = client.read(digital_output, 8, 2);
     auto second = client.read(register_port, 1);
     auto second_result = await(std::move(second));
@@ -195,10 +160,6 @@ static void normal_session(Client& client) {
 }
 
 int main() {
-#ifdef _WIN32
-    WSADATA winsock{};
-    assert(WSAStartup(MAKEWORD(2, 2), &winsock) == 0);
-#endif
     Client client;
     normal_session(client);
     normal_session(client);
@@ -330,7 +291,87 @@ int main() {
         assert(!result && result.error().code == Error::Code::disconnected);
         client.disconnect();
     }
-#ifdef _WIN32
-    WSACleanup();
-#endif
+    {
+        asio::io_context context;
+        Tcp::acceptor refused(context);
+        refused.open(Tcp::v4());
+        refused.bind(Tcp::endpoint(asio::ip::address_v4::loopback(), 0));
+        auto result = client.connect("127.0.0.1", refused.local_endpoint().port(), 500ms);
+        assert(!result && result.error().code == Error::Code::io);
+        assert(!client.connected());
+    }
+    {
+        Controller controller([](TestSocket peer) {
+            handshake(peer);
+            auto request = receive(peer);
+            reply(peer, request);
+            request = receive(peer);
+            reply(peer, request);
+            std::array<std::uint8_t, 1> end{};
+            assert(!read_exact(peer, end));
+        });
+        assert(client.connect("127.0.0.1", controller.port, 2s, 40ms));
+        assert(await(client.read(digital_output, 1)));
+        std::this_thread::sleep_for(100ms);
+        assert(client.connected());
+        assert(await(client.read(digital_output, 1)));
+        client.disconnect();
+    }
+    {
+        Controller controller([](TestSocket peer) {
+            handshake(peer);
+            const auto request = receive(peer);
+            auto response = make_response(static_cast<std::uint8_t>(request.header.sequence1));
+            response.header.message_type = MessageType::extended_response;
+            response.payload.resize(65534, 0xa5);
+            response.header.payload_size = static_cast<std::uint16_t>(response.payload.size());
+            const auto frame = encode(response);
+            for (std::size_t offset = 0; offset < frame.size(); offset += 997) {
+                send_all(peer, std::span(frame).subspan(
+                    offset, std::min<std::size_t>(997, frame.size() - offset)));
+            }
+            std::array<std::uint8_t, 1> end{};
+            assert(!read_exact(peer, end));
+        });
+        assert(client.connect("127.0.0.1", controller.port, 2s));
+        auto result = await(client.read(register_port, 1, 32767));
+        assert(result && result->payload.size() == 65534);
+        assert(std::ranges::all_of(result->payload, [](auto byte) { return byte == 0xa5; }));
+        client.disconnect();
+    }
+    {
+        Controller controller([](TestSocket peer) {
+            handshake(peer);
+            const auto request = receive(peer);
+            const auto frame = encode(make_response(
+                static_cast<std::uint8_t>(request.header.sequence1)));
+            send_all(peer, std::span(frame).first(header_size + 3));
+            std::array<std::uint8_t, 1> end{};
+            assert(!read_exact(peer, end));
+        });
+        assert(client.connect("127.0.0.1", controller.port, 2s, 40ms));
+        auto result = await(client.read(digital_output, 1));
+        assert(!result && result.error().code == Error::Code::timeout);
+        client.disconnect();
+    }
+    {
+        Controller controller([](TestSocket peer) {
+            handshake(peer);
+            std::this_thread::sleep_for(20ms);
+            std::array<std::uint8_t, 4096> bytes{};
+            while (read_exact(peer, bytes)) {}
+        });
+        std::vector<Client::ResponseFuture> futures;
+        {
+            Client scoped;
+            assert(scoped.connect("127.0.0.1", controller.port, 2s, 5s));
+            const std::string command(65535, 'X');
+            for (int i = 0; i < 128; ++i) futures.push_back(scoped.command(command));
+        }
+        for (auto& future : futures) {
+            auto result = await(std::move(future));
+            assert(!result && result.error().code == Error::Code::disconnected);
+        }
+    }
+    normal_session(client);
 }
